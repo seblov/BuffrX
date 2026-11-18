@@ -4,6 +4,8 @@ name: Windows portable package
 # Used when a Windows binary is needed but the change was made on another platform.
 
 on:
+  push:
+    branches: [windows-portable-audio]
   workflow_dispatch:
 
 permissions:
