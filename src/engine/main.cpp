@@ -1910,11 +1910,11 @@ int main(int argc, char** argv) {
       host.set_audio_metering(wanted);
       meter_requested = wanted;
       meters_were_active = false;
-      if (!wanted) ui_host.set_audio_levels(0.0f, 0.0f);
+      if (!wanted) ui_host.set_audio_levels(0.0f, 0.0f, {});
     }
     if (!wanted) return;
     if (!host.audio_meters_active()) {
-      if (meters_were_active) ui_host.set_audio_levels(0.0f, 0.0f);
+      if (meters_were_active) ui_host.set_audio_levels(0.0f, 0.0f, {});
       meters_were_active = false;
       return;
     }
@@ -1927,8 +1927,15 @@ int main(int argc, char** argv) {
     last_meter_sample = now;
     const bool sample_mic = now - last_mic_meter_sample >= kMicrophoneMeterSampleMs;
     if (sample_mic) last_mic_meter_sample = now;
-    host.sample_audio_levels(sample_mic);
-    ui_host.set_audio_levels(host.level_desktop(), host.level_mic());
+    std::vector<float> output_levels;
+    {
+      // The per-output meters live in the host's channel list, which a settings rebuild replaces: the
+      // sample and the slot list are read together under the engine lock. The plain levels are atomic.
+      std::lock_guard<std::mutex> engine_lock(protocol.engine_mutex());
+      host.sample_audio_levels(sample_mic);
+      output_levels = host.output_levels();
+    }
+    ui_host.set_audio_levels(host.level_desktop(), host.level_mic(), output_levels);
   };
 
   // The same beat while Windows holds the thread in its own loop: a panel drag or resize (the interface's own

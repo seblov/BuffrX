@@ -166,8 +166,7 @@ Json audio_json(const Config& c) {
   audio.set("mic_noise_gate", Json(c.mic_noise_gate));
   audio.set("audio_bitrate_kbps", Json(c.audio_bitrate_kbps));
   audio.set("audio_capture_mode", Json(c.audio_capture_mode));
-  audio.set("audio_capture_legacy_mode", Json(c.audio_capture_legacy_mode));
-  audio.set("apps", audio_apps_json(c.audio_apps));
+  audio.set("audio_outputs", audio_outputs_json(c.audio_outputs));
   audio.set("audio_app_prefs", auto_audio_prefs_json(c.audio_app_prefs));
   audio.set("audio_other_volume", Json(auto_volume(c.audio_other_volume)));
   audio.set("audio_other_muted", Json(c.audio_other_muted));
@@ -230,11 +229,10 @@ Json auto_audio_json(const ObsHost::AutoAudioView& view, bool watching, const st
   return json;
 }
 
-// The facts the missed-audio card judges in automatic mode: the lanes that are on, never a game named
-// because the manual selection is empty. A quiet desktop has no lanes and therefore nothing to say.
+// The facts the missed-audio card judges in automatic mode: the lanes that are on. A quiet desktop has
+// no lanes and therefore nothing to say.
 AudioHealthFacts auto_health_facts(const ObsHost::AutoAudioView& view, bool capture_active) {
   AudioHealthFacts facts;
-  facts.apps_mode = true;
   facts.capture_active = capture_active;
   for (const AutoAudioLane& lane : view.lanes) {
     if (lane.other) {
@@ -785,6 +783,9 @@ Json Protocol::status_json() {
   Json levels = Json::object();
   levels.set("desktop", Json(stats.level_desktop));
   levels.set("mic", Json(stats.level_mic));
+  Json output_levels = Json::array();
+  for (float level : stats.level_outputs) output_levels.push(Json(level));
+  levels.set("outputs", output_levels);
   levels.set("active", Json(stats.audio_meters_active));
   samples.set("levels", levels);
   json.set("stats", samples);
@@ -838,48 +839,36 @@ Json Protocol::status_json() {
     // Automatic mode is on even while the desktop is quiet: `on` is the setting, `watching` is the event
     // watcher that runs only while something is capturing, and `lanes` is what is audible right now.
     audio.set("auto", auto_audio_json(auto_view, auto_watcher_.ready(), auto_watch_error(auto_watcher_), false));
-    const bool recorded = config_.audio_capture_mode == "apps" && !host_.performance_active();
-    const std::vector<ObsHost::AudioSlotHealth> health = host_.audio_slot_health();
-    const std::vector<AudioApp> selected = effective_audio_apps(config_);
-    // The same facts the card's policy uses (audio_health.h), built from what is already on hand: the game the
-    // capture covers comes from the last poll, the tracks' own hook state from the host. Nothing here samples
-    // a meter, lists a window or starts a thread.
+    const bool recorded = config_.audio_capture_mode == "outputs" && !host_.performance_active();
+    const std::vector<ObsHost::AudioOutputHealth> health = host_.audio_output_health();
+    const std::vector<AudioOutput> selected = effective_audio_outputs(config_);
+    // One entry per selected output: whether its loopback source exists is what the page reports, never
+    // that a saved selection records. `recorded` is false in the other modes and while Performance mode's
+    // own mix runs: the saved outputs are kept but are not what is being written.
     AudioHealthFacts facts;
-    facts.apps_mode = recorded;
-    facts.capture_active = host_.buffer_wanted() || host_.recording_busy() || host_.timeline_writer_active();
-    facts.captured_game_exe = audio_warning_game_;
-    Json slots = Json::array();
+    facts.capture_active = capturing;
+    Json outputs = Json::array();
     int connected = 0;
     for (size_t i = 0; i < selected.size(); ++i) {
-      const AudioApp& app = selected[i];
-      ObsHost::AudioSlotHealth slot_health;
+      const AudioOutput& output = selected[i];
+      ObsHost::AudioOutputHealth slot_health;
       if (i < health.size()) slot_health = health[i];
-      const bool is_game = audio_app_is_game(app);
-      AudioHealthSlot fact;
-      fact.game = is_game;
-      fact.exe = !slot_health.exe.empty() ? slot_health.exe : app.exe;
-      fact.connected = slot_health.connected;
-      facts.slots.push_back(std::move(fact));
       Json slot = Json::object();
-      slot.set("game", Json(is_game));
-      slot.set("covered", Json(slot_health.covered));
-      slot.set("track", Json(kAudioAppFirstTrack + static_cast<int>(i)));
-      slot.set("exe", Json(is_game ? slot_health.exe : app.exe));
-      slot.set("title", Json(is_game ? std::string("Current game") : app.title));
-      slot.set("volume", Json(audio_app_volume(app.volume)));
-      slot.set("muted", Json(app.muted));
+      slot.set("device", Json(audio_output_key(output)));
+      slot.set("name", Json(audio_output_name(output, i)));
+      slot.set("track", Json(kAudioOutputFirstTrack + static_cast<int>(i)));
+      slot.set("volume", Json(audio_output_volume(output.volume)));
+      slot.set("muted", Json(output.muted));
       std::string state;
       if (!recorded) state = "off";
-      else if (slot_health.covered) state = "covered";
       else if (slot_health.failed) state = "failed";
-      else if (slot_health.connected) state = "connected";
+      else if (slot_health.allocated) state = "connected";
       else state = "waiting";
       if (state == "connected") ++connected;
       slot.set("state", Json(state));
       slot.set("allocated", Json(slot_health.allocated));
-      slots.push(slot);
+      outputs.push(slot);
     }
-    (void)capturing;
     if (auto_mode) {
       facts = auto_health_facts(auto_view, capturing);
       connected = 0;
@@ -892,17 +881,12 @@ Json Protocol::status_json() {
     uint32_t problem_ms = 0;
     if (problem != AudioProblem::none && problem_key == audio_notice_.key && audio_poll_ms_ != 0)
       problem_ms = audio_poll_ms_ - audio_notice_.first_seen_ms;
-    // What the card would say, kept on the wire after it is gone: a game that is playing and not recorded is
-    // a standing fact, not a toast. `problem_steady` hides the moment a game is still starting or a route is
-    // still connecting, so the line under the slots never flashes.
     audio.set("problem", Json(std::string(audio_problem_name(problem))));
     audio.set("problem_ms", Json(static_cast<int>(problem_ms)));
     audio.set("problem_steady", Json(audio_problem_steady(problem, problem_ms)));
-    audio.set("game_exe", Json(facts.captured_game_exe));
-    audio.set("slots", slots);
+    audio.set("outputs", outputs);
     audio.set("slots_used", Json(static_cast<int>(selected.size())));
-    audio.set("slot_limit", Json(kAudioAppMax));
-    audio.set("legacy_over", Json(static_cast<int>(over_limit_audio_apps(config_).size())));
+    audio.set("slot_limit", Json(kAudioOutputMax));
     audio.set("connected", Json(connected));
     audio.set("recorded", Json(recorded));
     json.set("audio", audio);
@@ -927,15 +911,13 @@ Json Protocol::apply_patch(const Json& patch, std::string& error) {
   if (!patch.has("video_preset") && !patch.has("quality") && !patch.has("quality_tier") && !patch.has("peak_mode"))
     config_.video_preset = before.video_preset;
   if (patch.has("audio")) config_apply_audio(patch["audio"], config_);
-  // Four selected slots, enforced here and not only by the page: a client cannot hand the engine a fifth
-  // route. A file that already holds more than four (written when eight were allowed) may still be edited
-  // or shrunk: only a selection larger than what is stored is refused.
-  if (patch.has("audio_apps") || (patch.has("audio") && patch["audio"].has("apps"))) {
-    const std::vector<AudioApp> patched = normalize_audio_apps(config_.audio_apps);
-    const std::vector<AudioApp> stored = normalize_audio_apps(before.audio_apps);
-    if (patched.size() > static_cast<size_t>(kAudioAppMax) && patched.size() > stored.size()) {
+  // Four selected outputs, enforced here and not only by the page: a client cannot hand the engine a fifth
+  // track. Any list longer than the four slots is refused rather than truncated.
+  if (patch.has("audio_outputs") || (patch.has("audio") && patch["audio"].has("audio_outputs"))) {
+    const Json& list = patch.has("audio_outputs") ? patch["audio_outputs"] : patch["audio"]["audio_outputs"];
+    if (list.is_array() && list.items().size() > static_cast<size_t>(kAudioOutputMax)) {
       config_ = before;
-      error = "Four apps at most can be recorded. Remove one first.";
+      error = "Four outputs at most can be recorded. Remove one first.";
       return Json::object();
     }
   }
@@ -1335,111 +1317,30 @@ void Protocol::poll_auto_audio(uint32_t now_ms) {
 }
 
 void Protocol::poll_audio(uint32_t now_ms) {
-  // The automatic lanes follow Windows' session events, not a meter. This runs first so the game target
-  // this function resolves is the same one the lanes give priority to.
+  // The automatic lanes follow Windows' session events, not a meter.
   poll_auto_audio(now_ms);
-  // What the Current game slot follows: the game BuffrX is actually capturing, never a fullscreen
-  // candidate or the detector's list. A display capture with no game behind it, a window capture or a
-  // pinned target that is no longer running leaves the slot waiting - it is never handed the desktop or
-  // an unrelated program.
-  GameAudioTarget target;
-  if (config_.capture_mode == "game") {
-    std::string exe, title;
-    if (game_capture_.capturing) {
-      if (active_game_alive(now_ms)) {
-        exe = game_capture_.active_exe;
-        title = game_capture_.active_title;
-      }
-    } else {
-      // A game chosen by hand (or one whose detection is off): its executable is the last part of the
-      // saved "title:class:exe" id, and its window must still exist. A stale saved target is not evidence.
-      const size_t colon = config_.game_title.find_last_of(':');
-      if (colon != std::string::npos) exe = decode_window_part(config_.game_title.substr(colon + 1));
-      if (!exe.empty()) {
-        if (game_audio_checked_ms_ == 0 || now_ms - game_audio_checked_ms_ >= 1000) {
-          game_audio_checked_ms_ = now_ms;
-          game_audio_alive_ = window_still_exists(active_game_hwnd_) || game_window_alive(exe);
-        }
-        if (!game_audio_alive_) exe.clear();
-      }
-    }
-    // win-wasapi resolves a process capture from a window id: without the class in it, no window is ever
-    // found. An id that is not addressable leaves the slot waiting instead of binding another window.
-    if (!exe.empty() && config_.game_title.find(':') != std::string::npos) {
-      target.active = true;
-      target.exe = exe;
-      target.window = config_.game_title;
-      target.title = title;
-    }
+  if (config_.audio_capture_mode != "auto") {
+    // Manual modes record output loopbacks. A selected output either has a source or it does not, and the
+    // page says so on its own row; there is no per-program connection to warn about. A notice of an
+    // earlier automatic run is forgotten, so returning to automatic starts its grace again.
+    audio_notice_ = AudioNoticeState{};
+    audio_poll_ms_ = now_ms;
+    return;
   }
-  host_.set_game_audio_target(target);
-
-  // The game whose picture the recording covers, which is the only game a card may name. The routing target above
-  // is not it: it exists only while game capture is the mode, and the gap this closes is the display capture that
-  // is missing the sound of the game it shows. The detectors' own state is the evidence (detected_game_exe_ is the
-  // tick's Timeline gate; game_capture_ is the automatic detector, which keeps its game while the user pins the
-  // display or a window), and a window capture covers a game only when that window is the game's program.
-  AudioCoverage coverage;
-  coverage.capture_mode = host_.capture_mode_now();
-  coverage.captured_game_exe = target.active ? target.exe : std::string();
-  std::string detected = detected_game_exe_;
-  if (detected.empty() && game_capture_.capturing) detected = game_capture_.active_exe;
-  coverage.detected_game_exe = detected;
-  if (config_.capture_mode == "window") {
-    // A saved window target is win-capture's "title:class:exe" id; its program is the part after the last colon.
-    const size_t colon = config_.window_id.find_last_of(':');
-    if (colon != std::string::npos) coverage.window_exe = decode_window_part(config_.window_id.substr(colon + 1));
-  }
-  const std::string game_exe = audio_warning_game(coverage);
-
-  // One card per unresolved problem, and the page keeps saying it after the card is gone. A slot waiting
-  // for a program that is simply closed is quiet: it is not a failure.
-  AudioHealthFacts facts;
-  facts.apps_mode = config_.audio_capture_mode == "apps" && !host_.performance_active();
-  facts.capture_active = host_.buffer_wanted() || host_.recording_busy() || host_.timeline_writer_active();
-  facts.captured_game_exe = game_exe;
-  const std::vector<ObsHost::AudioSlotHealth> health = host_.audio_slot_health();
-  const std::vector<AudioApp> selected = effective_audio_apps(config_);
-  for (size_t i = 0; i < selected.size(); ++i) {
-    AudioHealthSlot slot;
-    slot.game = audio_app_is_game(selected[i]);
-    slot.exe = i < health.size() && !health[i].exe.empty() ? health[i].exe : selected[i].exe;
-    slot.connected = i < health.size() && health[i].connected;
-    facts.slots.push_back(std::move(slot));
-  }
-  const bool auto_mode = config_.audio_capture_mode == "auto";
-  if (auto_mode) {
-    // Automatic capture is judged by the lanes that are actually on. An empty desktop is quiet, not a
-    // missing game: no card says the game is unrecorded because no manual selection exists.
-    facts = auto_health_facts(host_.auto_audio_view(), facts.capture_active);
-  }
+  // One card per unresolved problem. Automatic capture is judged by the lanes that are actually on: a quiet
+  // desktop has no lanes and therefore nothing to say.
+  AudioHealthFacts facts = auto_health_facts(host_.auto_audio_view(),
+                                             host_.buffer_wanted() || host_.recording_busy() ||
+                                                 host_.timeline_writer_active());
   const AudioProblem problem = audio_health_problem(facts);
   const std::string key = audio_health_key(facts, problem);
-  // The policy's own result and the game it judged ride on status.audio, so the page can keep saying what the
-  // one card said after the card is gone (and while notices are off). No second window or meter read: the
-  // identity is the coverage resolved just above.
-  audio_warning_game_ = game_exe;
   audio_poll_ms_ = now_ms;
   const bool due = audio_notice_due(audio_notice_, problem, key, now_ms);
   if (!due || !notifier) return;
-  const std::string game = game_exe.empty() ? std::string() : media_folder_name(game_exe);
-  switch (problem) {
-    case AudioProblem::game_missing:
-      notifier("GAME AUDIO IS NOT RECORDED",
-               game + " is playing, but Selected apps records only the apps you chose. Add it in Settings > Audio.");
-      break;
-    case AudioProblem::game_waiting:
-      notifier("GAME AUDIO IS NOT CONNECTED",
-               game + " is selected for audio, but its capture has not connected. Its track stays empty until it does.");
-      break;
-    case AudioProblem::all_unavailable:
-      notifier("APP AUDIO IS NOT CONNECTED",
-               auto_mode ? "None of the apps making sound has connected for automatic capture. Their tracks stay "
-                           "empty; the picture still records."
-                         : "None of the selected apps has connected for audio capture. Their tracks stay empty; the picture still records.");
-      break;
-    case AudioProblem::none:
-      break;
+  if (problem == AudioProblem::all_unavailable) {
+    notifier("APP AUDIO IS NOT CONNECTED",
+             "None of the apps making sound has connected for automatic capture. Their tracks stay empty; "
+             "the picture still records.");
   }
 }
 

@@ -1,6 +1,6 @@
 // The audio mixer's array edits, kept pure so the panel's faders and menus can be checked without a window.
-// An app entry is written whole and every other entry and key is carried through: the engine's own fields
-// (window, exe, title, track) and a hand-edited key the person added are never dropped by an adjustment.
+// An output entry is written whole and every other entry and key is carried through: the engine's own
+// fields (device, name) and a hand-edited key the person added are never dropped by an adjustment.
 #pragma once
 
 #include <algorithm>
@@ -13,46 +13,27 @@
 
 namespace bx::ui {
 
-// The level a strip shows for an app whose entry predates the field, or a hand-edited value outside 0..1.
-inline double audio_app_volume(const Json& app) {
-  return std::clamp(app["volume"].as_double(1.0), 0.0, 1.0);
+// The level a strip shows for an output whose entry predates the field, or a hand-edited value outside 0..1.
+inline double audio_output_volume(const Json& output) {
+  return std::clamp(output["volume"].as_double(1.0), 0.0, 1.0);
 }
 
-inline bool audio_app_muted(const Json& app) { return app["muted"].as_bool(false); }
+inline bool audio_output_muted(const Json& output) { return output["muted"].as_bool(false); }
 
-// One pick in the expanded mixer: the program's window and name, its slot placeholder, and the two mixer
-// fields at their defaults (full volume, unmuted).
-inline Json audio_app_entry(const Json& window) {
+// One output the person picked from the device list: its id, the name it had at that moment, and the two
+// mixer fields at their defaults (full volume, unmuted).
+inline Json audio_output_entry(const Json& device) {
   Json entry = Json::object();
-  entry.set("window", Json(window["id"].as_string()));
-  entry.set("exe", Json(window["exe"].as_string()));
-  entry.set("title", Json(window["name"].as_string()));
-  entry.set("track", Json(2));  // the slot's position decides the real track; kept for older builds
+  entry.set("device", Json(device["id"].as_string()));
+  entry.set("name", Json(device["name"].as_string(device["id"].as_string())));
   entry.set("volume", Json(1.0));
   entry.set("muted", Json(false));
   return entry;
 }
 
-// Add (append, until `limit`) or replace one slot. The other entries keep their order and every key.
-inline Json audio_apps_with_entry(const Json& apps, const Json& entry, int replace_slot, size_t limit) {
-  const std::vector<Json>& items = apps.items();
-  Json out = Json::array();
-  bool placed = false;
-  for (size_t i = 0; i < items.size(); ++i) {
-    if (replace_slot >= 0 && i == static_cast<size_t>(replace_slot)) {
-      out.push(entry);
-      placed = true;
-    } else {
-      out.push(items[i]);
-    }
-  }
-  if (!placed && replace_slot < 0 && items.size() < limit) out.push(entry);
-  return out;
-}
-
-// One field of one slot, leaving the entry's other fields and every other entry as they were.
-inline Json audio_apps_with_field(const Json& apps, size_t slot, const char* key, Json value) {
-  const std::vector<Json>& items = apps.items();
+// One field of one output, leaving the entry's other fields and every other entry as they were.
+inline Json audio_outputs_with_field(const Json& outputs, size_t slot, const char* key, Json value) {
+  const std::vector<Json>& items = outputs.items();
   Json out = Json::array();
   for (size_t i = 0; i < items.size(); ++i) {
     Json entry = items[i];
@@ -62,8 +43,8 @@ inline Json audio_apps_with_field(const Json& apps, size_t slot, const char* key
   return out;
 }
 
-inline Json audio_apps_without(const Json& apps, size_t slot) {
-  const std::vector<Json>& items = apps.items();
+inline Json audio_outputs_without(const Json& outputs, size_t slot) {
+  const std::vector<Json>& items = outputs.items();
   Json out = Json::array();
   for (size_t i = 0; i < items.size(); ++i) {
     if (i != slot) out.push(items[i]);
@@ -71,8 +52,21 @@ inline Json audio_apps_without(const Json& apps, size_t slot) {
   return out;
 }
 
+// Appends one output unless the same device is already selected or all four slots are taken.
+inline Json audio_outputs_with_device(const Json& outputs, const Json& entry, size_t limit) {
+  const std::vector<Json>& items = outputs.items();
+  Json out = Json::array();
+  const std::string device = entry["device"].as_string();
+  for (const Json& item : items) {
+    if (item["device"].as_string() == device) return outputs;
+    out.push(item);
+  }
+  if (items.size() < limit) out.push(entry);
+  return out;
+}
+
 // A strip's one-line state: short enough for a 76-unit channel, and only ever what the engine reported.
-// The full sentence (audio_slot_hint) stays in the strip's hover card, so the line never has to carry a
+// The full sentence (audio_output_hint) stays in the strip's hover card, so the line never has to carry a
 // reason. Muted and off come first: a channel that is not heard says so before anything about capture.
 enum class StripState { off, muted, saved, failed, recording, ready, shared, waiting };
 
@@ -107,8 +101,8 @@ inline bool audio_volume_at_full(double volume) { return volume >= 0.9995; }
 
 // The reset writes the one field: the mute and every other entry are carried through untouched, so a
 // muted channel stays muted and comes back at the gain the person chose.
-inline Json audio_apps_with_volume_reset(const Json& apps, size_t slot) {
-  return audio_apps_with_field(apps, slot, "volume", Json(1.0));
+inline Json audio_outputs_with_volume_reset(const Json& outputs, size_t slot) {
+  return audio_outputs_with_field(outputs, slot, "volume", Json(1.0));
 }
 
 // ---------------------------------------------------------------- automatic app audio

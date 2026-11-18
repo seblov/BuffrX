@@ -102,27 +102,21 @@ void strings_from_json(const Json& json, std::vector<std::string>& values) {
   }
 }
 
-// The application routes ride in the config file and on the pipe as one array of objects. Normalizing on
-// the way in keeps a hand-edited duplicate from building an encoder nobody reads, and keeps every entry a
-// legacy file holds (up to the stored ceiling): the four slots are chosen from the list, never by deleting
-// what is beyond them here.
-void audio_apps_from_json(const Json& json, std::vector<AudioApp>& apps) {
+// The selected output devices ride in the config file and on the pipe as one array of objects. Normalizing
+// on the way in deduplicates a hand-edited entry and keeps only the four slots the plan can record.
+void audio_outputs_from_json(const Json& json, std::vector<AudioOutput>& outputs) {
   if (!json.is_array()) return;
-  std::vector<AudioApp> parsed;
+  std::vector<AudioOutput> parsed;
   for (const Json& item : json.items()) {
     if (!item.is_object()) continue;
-    AudioApp app;
-    app.window = item["window"].as_string();
-    app.exe = item["exe"].as_string();
-    app.title = item["title"].as_string();
-    app.kind = item["kind"].as_string();
-    app.track = static_cast<int>(item["track"].as_int(2));
-    // Missing in every file written before faders existed: 1.0 and unmuted, exactly as those files recorded.
-    app.volume = audio_app_volume(item["volume"].as_double(1.0));
-    app.muted = item["muted"].as_bool(false);
-    parsed.push_back(std::move(app));
+    AudioOutput output;
+    output.device = item["device"].as_string();
+    output.name = item["name"].as_string();
+    output.volume = audio_output_volume(item["volume"].as_double(1.0));
+    output.muted = item["muted"].as_bool(false);
+    parsed.push_back(std::move(output));
   }
-  apps = normalize_audio_apps(parsed);
+  outputs = normalize_audio_outputs(parsed);
 }
 
 // Automatic mode's per-program controls (audio_auto.h). The object is keyed by the lower-case executable,
@@ -150,19 +144,6 @@ void audio_prefs_from_json(const Json& json, std::map<std::string, AutoAudioPref
     if (value.has("volume")) pref.volume = auto_volume(value["volume"].as_double(pref.volume));
     if (value.has("muted")) pref.muted = value["muted"].as_bool(pref.muted);
     if (value.has("excluded")) pref.excluded = value["excluded"].as_bool(pref.excluded);
-  }
-}
-
-// A program's saved route seeds its automatic preference once. Additive: a preference the file already
-// carries keeps every field, so seeding never overwrites a choice made in automatic mode.
-void seed_audio_apps_prefs(const std::vector<AudioApp>& apps, std::map<std::string, AutoAudioPref>& prefs) {
-  for (const AudioApp& app : apps) {
-    const std::string key = auto_pref_key(app.exe);
-    if (key.empty() || prefs.count(key) != 0) continue;
-    AutoAudioPref pref;
-    pref.volume = auto_volume(app.volume);
-    pref.muted = app.muted;
-    prefs[key] = pref;
   }
 }
 
@@ -299,9 +280,7 @@ Json config_to_json(const Config& c) {
   json.set("audio_tracks", Json(c.audio_tracks));
   json.set("audio_bitrate_kbps", Json(c.audio_bitrate_kbps));
   json.set("audio_capture_mode", Json(c.audio_capture_mode));
-  json.set("audio_capture_legacy_mode", Json(c.audio_capture_legacy_mode));
-  json.set("audio_apps", audio_apps_json(c.audio_apps));
-  json.set("audio_apps_chosen", Json(c.audio_apps_chosen));
+  json.set("audio_outputs", audio_outputs_json(c.audio_outputs));
   json.set("audio_app_prefs", audio_prefs_to_json(c.audio_app_prefs));
   json.set("audio_other_volume", Json(auto_volume(c.audio_other_volume)));
   json.set("audio_other_muted", Json(c.audio_other_muted));
@@ -374,20 +353,15 @@ void config_apply_audio(const Json& j, Config& c) {
   if (j.has("audio_bitrate_kbps")) c.audio_bitrate_kbps = static_cast<int>(j["audio_bitrate_kbps"].as_int(c.audio_bitrate_kbps));
   if (j.has("audio_capture_mode")) {
     const std::string mode = j["audio_capture_mode"].as_string(c.audio_capture_mode);
-    if (mode == "desktop" || mode == "apps" || mode == "auto") c.audio_capture_mode = mode;  // an unknown mode changes nothing
+    // "apps" was the pre-version-14 manual mode. An older client asking for it gets output selection.
+    if (mode == "desktop" || mode == "outputs" || mode == "auto" || mode == "apps") c.audio_capture_mode = mode;
+    if (c.audio_capture_mode == "apps") c.audio_capture_mode = "outputs";
     if (c.audio_capture_mode == "auto" && !kAutoAudioSupported) c.audio_capture_mode = "desktop";
   }
   if (j.has("audio_app_prefs")) audio_prefs_from_json(j["audio_app_prefs"], c.audio_app_prefs);
   if (j.has("audio_other_volume")) c.audio_other_volume = auto_volume(j["audio_other_volume"].as_double(c.audio_other_volume));
   if (j.has("audio_other_muted")) c.audio_other_muted = j["audio_other_muted"].as_bool(c.audio_other_muted);
-  if (j.has("audio_apps")) audio_apps_from_json(j["audio_apps"], c.audio_apps);
-  if (j.has("apps")) audio_apps_from_json(j["apps"], c.audio_apps);
-  // Writing the list at all is a choice, including writing it empty. That is what lets the page tell a
-  // first-ever selection from a list the person emptied on purpose. An explicit flag wins, so a stored
-  // file keeps the answer it was saved with.
-  const bool apps_written = j.has("audio_apps") || j.has("apps");
-  if (j.has("audio_apps_chosen")) c.audio_apps_chosen = j["audio_apps_chosen"].as_bool(c.audio_apps_chosen);
-  else if (apps_written) c.audio_apps_chosen = true;
+  if (j.has("audio_outputs")) audio_outputs_from_json(j["audio_outputs"], c.audio_outputs);
   c.audio_tracks = std::clamp(c.audio_tracks, 1, 6);
   c.desktop_volume = std::clamp(c.desktop_volume, 0.0, 1.0);
   c.mic_volume = std::clamp(c.mic_volume, 0.0, 1.0);
@@ -661,14 +635,11 @@ bool load_config(const std::string& path, Config& config, std::string& error) {
   }
   config.config_version = 1;  // a file with no version predates versioning
   config_from_json(json, config);
-  // A file that already carries a valid recording mode already made that choice: hand-edited, written by a
-  // newer build then downgraded, or saved by a client. Only an absent or unknown value lets the migration guess.
-  const std::string stored_mode = json["audio_capture_mode"].as_string();
-  migrate_config(config, stored_mode == "desktop" || stored_mode == "apps");
+  migrate_config(config);
   return true;
 }
 
-void migrate_config(Config& config, bool mode_stored) {
+void migrate_config(Config& config) {
   if (config.config_version < 2) {
     if (config.container == "mkv") config.container = "mp4";
     if (config.hotkey_save == "Alt+C") config.hotkey_save = "Alt+1";
@@ -696,33 +667,26 @@ void migrate_config(Config& config, bool mode_stored) {
     config.hotkey_record_pad = "Pad:VIEW+MENU";
     config.hotkey_toggle_ui_pad = "Pad:Y+VIEW";
   }
-  // Version 10: what to record. A file that already carries application routes recorded them until now,
-  // so it starts in "apps"; a file without them starts in "desktop". The routes themselves are untouched.
-  // A file that already stores a valid mode made that choice, even under an older version (written by a
-  // newer build, a profile or a hand edit), and that choice is never overwritten.
-  if (config.config_version < 10 && !mode_stored) {
-    config.audio_capture_mode = config.audio_apps.empty() ? "desktop" : "apps";
-  }
-  // Version 12: whether an application selection was ever made. Kept for compatibility with files that carry
-  // it; a selection is never seeded from it, so this no longer changes what the page shows or records.
-  if (config.config_version < 12) {
-    config.audio_apps_chosen = config.audio_capture_mode == "apps" || !config.audio_apps.empty();
-  }
-  // Version 13: automatic capture is the normal mode. The mode the file recorded with is kept for
-  // compatibility, the routes stay untouched, and each route's gain and mute seeds an automatic
-  // preference for the same executable. A file already written by this version keeps the mode it has.
+  // Version 10 chose the then-new app mode; version 14 replaces that mode with output selection, so an
+  // old file's routes are not carried forward. A file that already stores a valid mode made that choice,
+  // even under an older version (written by a newer build, a profile or a hand edit), and version 14
+  // converts what it can.
+  // Version 13: automatic capture is the normal mode. A file already written by this version keeps the
+  // mode it has.
   if (config.config_version < 13) {
-    if (config.audio_capture_legacy_mode.empty()) {
-      if (mode_stored && (config.audio_capture_mode == "desktop" || config.audio_capture_mode == "apps")) {
-        config.audio_capture_legacy_mode = config.audio_capture_mode;
-      } else if (config.config_version < 10) {
-        config.audio_capture_legacy_mode = config.audio_apps.empty() ? "desktop" : "apps";
-      } else {
-        config.audio_capture_legacy_mode = config.audio_capture_mode;
-      }
-    }
     config.audio_capture_mode = kAutoAudioSupported ? "auto" : "desktop";
-    seed_audio_apps_prefs(config.audio_apps, config.audio_app_prefs);
+  }
+  // Version 14: manual audio selects outputs, not applications. A file that recorded selected apps moves
+  // to the outputs mode with the output device it already had, so the move never leaves it silent; a
+  // deliberate empty outputs list in a version 14 file stays empty.
+  if (config.config_version < 14) {
+    if (config.audio_capture_mode == "apps") config.audio_capture_mode = "outputs";
+    if (config.audio_capture_mode == "outputs" && config.audio_outputs.empty()) {
+      AudioOutput output;
+      output.device = config.desktop_device.empty() ? "default" : config.desktop_device;
+      if (output.device == "default") output.name = "System default";
+      config.audio_outputs.push_back(std::move(output));
+    }
   }
   config.config_version = Config::kConfigVersion;
 }
@@ -791,10 +755,10 @@ unsigned config_change_bits(const Config& before, const Config& after) {
   note(before.audio_tracks != after.audio_tracks, kConfigRebuilds);
   note(audio_track_count(before) != audio_track_count(after), kConfigRebuilds);
   note(before.audio_bitrate_kbps != after.audio_bitrate_kbps, kConfigRebuilds);
-  // A mode change re-bits which source feeds the mix. A route change counts only while the mode records it:
-  // an app kept for later must not restart the buffer (or be refused) while desktop audio is what records.
+  // A mode change re-bits which source feeds the mix. An output change counts only while the mode records
+  // it: an output kept for later must not restart the buffer while all-sound-together is what records.
   note(before.audio_capture_mode != after.audio_capture_mode, kConfigRebuilds);
-  note(!audio_apps_equal(effective_audio_apps(before), effective_audio_apps(after)), kConfigRebuilds);
+  note(!audio_outputs_equal(effective_audio_outputs(before), effective_audio_outputs(after)), kConfigRebuilds);
   return changed;
 }
 

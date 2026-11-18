@@ -1,9 +1,9 @@
 # What this checks: the native Settings > Audio page draws in every recording mode, and the mode and saved
-# routes are still what was chosen after each switch. It starts an engine of its own on a throwaway data root
+# outputs are still what was chosen after each switch. It starts an engine of its own on a throwaway data root
 # and pipe (probe-lib.ps1), so it runs beside the BuffrX the person is using, and it stops only that process.
 #
 # Run after the UI is staged:  powershell -File tools\audio-settings-probe.ps1 -KeepData
-# The four PNGs (desktop, apps, empty, performance) are left in <data root>\audio-settings for review.
+# The four PNGs (desktop, outputs, empty, performance) are left in <data root>\audio-settings for review.
 param([switch]$KeepData, [string]$Engine = 'buffrx-engine.exe')
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'probe-lib.ps1')
@@ -41,8 +41,8 @@ try {
   }
 
   $routes = @(
-    @{ window = 'test:Discord.exe'; exe = 'Discord.exe'; title = 'Discord'; track = 3 },
-    @{ window = 'test:cs2.exe'; exe = 'cs2.exe'; title = 'Counter-Strike 2'; track = 4 }
+    @{ device = 'probe-speakers'; name = 'Headphones'; volume = 1.0; muted = $false },
+    @{ device = 'probe-dock'; name = 'Dock'; volume = 1.0; muted = $false }
   )
   function Set-Audio([hashtable]$audio) { Ask-Engine $e 'audio.set' ($audio | ConvertTo-Json -Depth 5 -Compress) }
   function Audio-Get { ((Ask-Engine $e 'audio.get') | ConvertFrom-Json).data }
@@ -52,25 +52,25 @@ try {
   $audio = Audio-Get
   if ($audio.audio_capture_mode -ne 'desktop') { Fail ('the default mode is not desktop: ' + $audio.audio_capture_mode) }
 
-  # 2. Selected apps with two routes, each on its own track.
-  $null = Set-Audio @{ audio_capture_mode = 'apps'; apps = $routes }
-  Capture 'apps'
+  # 2. Manual with two outputs, each on its own track.
+  $null = Set-Audio @{ audio_capture_mode = 'outputs'; audio_outputs = $routes }
+  Capture 'outputs'
   $audio = Audio-Get
-  if ($audio.audio_capture_mode -ne 'apps' -or $audio.apps.Count -ne 2) {
-    Fail ('two app routes did not stay two routes in apps mode: ' + (($audio | ConvertTo-Json -Depth 4 -Compress)))
+  if ($audio.audio_capture_mode -ne 'outputs' -or $audio.audio_outputs.Count -ne 2) {
+    Fail ('two outputs did not stay two outputs in manual mode: ' + (($audio | ConvertTo-Json -Depth 4 -Compress)))
   }
 
-  # 3. Selected apps with nothing chosen: no fallback to the desktop, only the microphone.
-  $null = Set-Audio @{ apps = @() }
+  # 3. Manual with nothing chosen: no fallback to the desktop, only the microphone.
+  $null = Set-Audio @{ audio_outputs = @() }
   Capture 'empty'
   $audio = Audio-Get
-  if ($audio.audio_capture_mode -ne 'apps' -or $audio.apps.Count -ne 0) {
-    Fail ('an empty app list changed the mode or kept routes: ' + (($audio | ConvertTo-Json -Depth 4 -Compress)))
+  if ($audio.audio_capture_mode -ne 'outputs' -or $audio.audio_outputs.Count -ne 0) {
+    Fail ('an empty output list changed the mode or kept routes: ' + (($audio | ConvertTo-Json -Depth 4 -Compress)))
   }
 
-  # 4. Performance mode: one mixed desktop track, the saved apps left alone. It is active from the stored
+  # 4. Performance mode: one mixed desktop track, the saved outputs left alone. It is active from the stored
   #    choice alone, so the captured page is the Performance state; the stored choice must not move.
-  $null = Set-Audio @{ apps = $routes }
+  $null = Set-Audio @{ audio_outputs = $routes }
   $null = Ask-Engine $e 'config.set' (@{ patch = @{ performance_when = 'always' } } | ConvertTo-Json -Depth 4 -Compress)
   $status = ((Ask-Engine $e 'status.get') | ConvertFrom-Json).data
   if (-not $status.performance.active) {
@@ -78,8 +78,8 @@ try {
   }
   Capture 'performance'
   $audio = Audio-Get
-  if ($audio.audio_capture_mode -ne 'apps' -or $audio.apps.Count -ne 2) {
-    Fail ('Performance mode rewrote the stored audio mode or routes: ' + (($audio | ConvertTo-Json -Depth 4 -Compress)))
+  if ($audio.audio_capture_mode -ne 'outputs' -or $audio.audio_outputs.Count -ne 2) {
+    Fail ('Performance mode rewrote the stored audio mode or outputs: ' + (($audio | ConvertTo-Json -Depth 4 -Compress)))
   }
   $null = Ask-Engine $e 'config.set' (@{ patch = @{ performance_when = 'off' } } | ConvertTo-Json -Depth 4 -Compress)
 

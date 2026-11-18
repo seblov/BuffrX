@@ -1933,8 +1933,6 @@ Animation animation_reason(const ViewEnv& env) {
   if (env.panel.settings.empty() && env.now_ms - env.panel.live.audio_drawn_at < 1000 &&
       env.now_ms < env.panel.audio_meter_until)
     return {"audio_meter", 125};
-  // The app picker's peaks are measured at 4 Hz only while it is open; its rows re-sort on the same beat.
-  if (env.panel.settings == "audio" && env.panel.picking_audio_app) return {"audio_picker", 250};
   if (!env.store.toasts.empty()) return {};  // toasts are static; they expire through the store
   if (env.store.pulse_at && env.now_ms - env.store.pulse_at < 1000) return {"save_pulse", kSmooth};  // the tick flash a save leaves
   if (!env.store.library_loaded) return {"library_loading", kSpinnerMs};

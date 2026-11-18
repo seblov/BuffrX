@@ -38,7 +38,7 @@ void audio_speaker_prune(const std::vector<std::string>& keep);
 // A program's speaker, its waves moving only while its meter says it sounds and only where it is seen.
 void audio_speaker_icon(const Json& sessions, const std::string& exe, ImVec2 at, float size, uint32_t now_ms,
                         PanelState& panel);
-std::string audio_slot_hint(const Json& status, size_t index, bool game, const std::string& name);
+std::string audio_output_hint(const Json& status, size_t index, const std::string& name);
 
 // The Timeline: the panel's and the tray's TIMELINE entry opens (or closes) the preview, and the notices a writer
 // state change earns once - started, paused outside the game, stopped for disk space. Called once per frame.

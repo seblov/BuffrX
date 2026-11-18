@@ -32,10 +32,10 @@ Config apply_performance_plan(const Config& user, const PerformancePlan& plan) {
     out.audio_tracks = 6;
     out.audio_bitrate_kbps = plan.audio_bitrate_kbps;
   } else {
-    // Application capture would need the loopback off and several encoders, so the effective config records
-    // the desktop; the stored mode and routes are untouched and come back when the mode ends.
+    // Per-output capture would need several encoders, so the effective config records the desktop; the
+    // stored mode and outputs are untouched and come back when the mode ends.
     out.audio_capture_mode = "desktop";
-    out.audio_apps.clear();
+    out.audio_outputs.clear();
     out.audio_bitrate_kbps = plan.audio_bitrate_kbps;
   }
   out.quality = "standard";

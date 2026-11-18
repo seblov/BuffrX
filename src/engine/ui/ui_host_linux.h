@@ -49,7 +49,7 @@ public:
   bool capture(const std::string& view, const std::string& png_path, std::string& error);
   bool any_visible() const;
   bool audio_meter_visible() const;
-  void set_audio_levels(float desktop, float mic);
+  void set_audio_levels(float desktop, float mic, const std::vector<float>& outputs);
   void set_buffer_active(bool active) { buffer_active_.store(active, std::memory_order_relaxed); }
   bool foreground_is_ours() const;
   bool input(const Json& args, std::string& error);
@@ -133,6 +133,8 @@ private:
   std::string frame_report_;
   uint64_t last_frame_ms_ = 0;
   float desktop_level_ = 0.0f, mic_level_ = 0.0f;
+  std::array<float, 4> output_levels_{};
+  int output_level_count_ = 0;
   std::function<void()> modal_heartbeat_;
 };
 

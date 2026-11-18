@@ -47,9 +47,9 @@ bool media_identity(const std::string& path, MediaIdentity& identity);
 
 struct AudioTrackLabel {
   int index = 0;                     // 1-based, as the sidecar and the product count tracks
-  std::string role;                  // mix | desktop | microphone | application | combined | empty | track
+  std::string role;                  // mix | desktop | microphone | output | application | combined | empty | track
   std::string title;                 // "BuffrX Mix", "Discord", ...; empty for an import
-  std::vector<std::string> sources;  // desktop | microphone | app:<exe>
+  std::vector<std::string> sources;  // desktop | microphone | output:<device id> | app:<exe>
 };
 
 struct AudioLayout {

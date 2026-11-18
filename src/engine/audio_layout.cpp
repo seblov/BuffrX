@@ -105,8 +105,9 @@ bool read_text(const std::string& path, std::string& text) {
 }
 
 bool known_role(const std::string& role) {
+  // "application" and "desktop" are kept readable: clips recorded by earlier builds keep their labels.
   return role == "mix" || role == "desktop" || role == "microphone" || role == "application" ||
-         role == "combined" || role == "empty";
+         role == "output" || role == "combined" || role == "empty";
 }
 
 std::string clipped(const std::string& text) { return text.size() > kMaxText ? text.substr(0, kMaxText) : text; }

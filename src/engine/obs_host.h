@@ -5,6 +5,7 @@
 // shows comes out of `stats()` or an event callback.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -114,6 +115,7 @@ struct EngineStats {
   int display_hz = 0;  // the capture's display refresh rate, 0 unknown
   float level_desktop = 0.0;       // peak level on a -60..0 dBFS scale, 0..1
   float level_mic = 0.0;           // RMS level on a -42..0 dBFS scale, 0..1
+  std::vector<float> level_outputs;  // one per selected output, same scale as level_desktop
   bool audio_meters_active = false;
   std::string capture_mode;
   std::string capture_target;  // the name a person reads; for a display fallback, the screen actually captured
@@ -288,21 +290,16 @@ public:
 
   EngineStats stats() const;
 
-  // One selected audio slot as it really is (audio_routing.h): whether its source exists (allocated) and
-  // whether Windows has it hooked to a running program (connected), which is what the page reports instead
-  // of claiming a route records. A slot with no source because the program is not running is waiting, not
-  // failed. Read under the engine lock (status_json does), never by sampling meters.
-  struct AudioSlotHealth {
-    bool game = false;
-    bool covered = false;    // a game slot whose program is already a named slot: no source of its own
-    std::string exe;         // the program the slot was chosen for; empty on a game slot with no game
-    std::string title;
+  // One selected output as it really is (audio_routing.h): whether its loopback source exists at all.
+  // A device that is unplugged after its source was made keeps working as silence; a source that could
+  // not be made is the one failure worth reporting. Read under the engine lock.
+  struct AudioOutputHealth {
+    std::string device;
     int track = 0;
     bool allocated = false;
-    bool connected = false;
-    bool failed = false;     // the capture source could not be created at all
+    bool failed = false;
   };
-  std::vector<AudioSlotHealth> audio_slot_health() const;
+  std::vector<AudioOutputHealth> audio_output_health() const;
 
   // Automatic audio (audio_auto.h): the host owns the four fixed buses (tracks 3..5 and Other audio on
   // track 6). A session snapshot is applied live; an arrival or departure never rebuilds an encoder, never
@@ -324,10 +321,6 @@ public:
   // summarising who occupied it. `whole_output` uses the manual recording's own summary, which survives
   // the rolling journal's pruning. The bus ids never change.
   AudioRoutingPlan audio_plan_for_span(uint64_t start_ms, uint64_t end_ms, bool whole_output) const;
-  // The game BuffrX is actually capturing, handed in by the protocol from its own capture target (never
-  // from the detector's candidate list). A change updates the one game slot's source in place: no encoder
-  // is rebuilt, so the replay ring is kept across a game change. Caller holds the engine lock.
-  void set_game_audio_target(const GameAudioTarget& target);
 
   // The tick raises this once the engine has been idle past the grace and the sources are released; main.cpp takes
   // it and queues the action worker, because sleeping is a video reset and does not belong on the window thread.
@@ -425,6 +418,15 @@ public:
   bool audio_meters_active() const { return audio_meters_active_.load(std::memory_order_relaxed); }
   float level_desktop() const { return level_desktop_.load(std::memory_order_relaxed); }
   float level_mic() const { return level_mic_.load(std::memory_order_relaxed); }
+  float level_output(size_t slot) const {
+    return slot < level_outputs_.size() ? level_outputs_[slot].load(std::memory_order_relaxed) : 0.0f;
+  }
+  std::vector<float> output_levels() const {
+    std::vector<float> levels;
+    levels.reserve(output_channels_.size());
+    for (size_t i = 0; i < output_channels_.size(); ++i) levels.push_back(level_output(i));
+    return levels;
+  }
 
   std::vector<DisplayInfo> displays();
   std::vector<WindowInfo> windows();
@@ -548,19 +550,13 @@ private:
   std::string display_warned_name_;
   static constexpr uint32_t kDisplayCheckMs = 2000;
   bool configure_audio(const Config& config);
-  // Process-loopback captures for the application slots (audio_routing.h). `configure_audio` reconciles
-  // these with the plan; the tick only re-creates one whose source could not be made at all, and reads the
-  // hook state so the page reports allocated and connected truthfully.
-  struct AppAudioChannel;
-  void configure_app_audio(const AudioRoutingPlan& plan);
-  void poll_audio_health();
-  void update_game_audio_channel();
-  bool create_app_channel(AppAudioChannel& channel, const AudioApp& app, uint32_t mixers,
-                          uint32_t view_channel);
-  void release_app_channel(AppAudioChannel& channel);
-  static void on_app_hooked(void* data, struct calldata* call);
-  static void on_app_unhooked(void* data, struct calldata* call);
-  void release_app_audio();
+  // Loopback captures for the selected outputs (audio_routing.h). `configure_audio` reconciles these with
+  // the plan; a device switch or a fader updates the running source in place.
+  struct OutputAudioChannel;
+  void configure_output_audio(const AudioRoutingPlan& plan);
+  void poll_output_audio();
+  void release_output_channel(OutputAudioChannel& channel);
+  void release_output_audio();
   void apply_mic_filters(const Config& config);
   void attach_meter(obs_source* source, obs_volmeter** meter, std::atomic<float>* into);
   void detach_meter(obs_volmeter** meter);
@@ -755,25 +751,16 @@ private:
   struct obs_scene_item* capture_item_ = nullptr;
   obs_source* desktop_ = nullptr;
   obs_source* mic_ = nullptr;
-  // One per application slot, in plan order; the channel is kAppAudioViewChannelBase + index. Held by
-  // pointer so win-wasapi's hooked/unhooked callbacks keep a stable address when a slot is replaced.
-  struct AppAudioChannel {
-    std::string key;     // the executable (lowercase) or "game"
-    std::string window;  // win-capture id the source is bound to
-    std::string exe;
-    bool game = false;
-    bool covered = false;  // the game already has a named slot: this lane makes no source
-    bool failed = false;  // obs_source_create returned null: no source exists at all
+  // One per selected output, in plan order; the channel is kOutputAudioViewChannelBase + index. Held by
+  // pointer so a vector reallocation never moves a meter callback's target or the bound device string.
+  struct OutputAudioChannel {
+    std::string device;  // the endpoint the source is bound to
     obs_source* source = nullptr;
-    bool said_missing = false;
-    // Written by win-wasapi's capture thread and read by the tick and the status. The strings are behind
-    // their own lock so a signal can never race a status snapshot into a dangling pointer.
-    std::atomic<bool> connected{false};
-    mutable std::mutex health_mutex;
-    std::string hooked_exe;
-    std::string hooked_title;
+    obs_volmeter* meter = nullptr;
+    std::atomic<float> level_db{-100.0f};
+    bool failed = false;  // obs_source_create returned null: no source exists at all
   };
-  std::vector<std::unique_ptr<AppAudioChannel>> app_channels_;
+  std::vector<std::unique_ptr<OutputAudioChannel>> output_channels_;
   // Automatic mode's four buses. Tracks 3..5 hold one program each; track 6 is the remaining programs
   // together. A bus can mix several process trees of one program (two browser profiles) or of many
   // programs, so each tree is its own process capture inside one persistent private scene: one output
@@ -818,13 +805,8 @@ private:
   void release_auto_channel(AutoAudioChannel& channel);
   void release_auto_audio();
 
-  static constexpr uint32_t kAudioAppCheckMs = 5000;   // a source that could not be made is retried this slowly
-  static constexpr uint32_t kAudioHealthPollMs = 2000;  // get_hooked is read this often for the page's state
-  uint32_t audio_app_check_at_ = 0;
-  uint32_t audio_health_poll_at_ = 0;
-  // The game the protocol says is being captured, for the Current game slot. Not part of the config: a
-  // game change is a live update, not a settings change.
-  GameAudioTarget game_target_;
+  static constexpr uint32_t kOutputAudioCheckMs = 5000;  // a source that could not be made is retried this slowly
+  uint32_t output_audio_check_at_ = 0;
   // The routing the running encoders were built with: encoder titles and the sidecar beside a saved file
   // describe recording time, never the config as it is when the file finishes.
   AudioRoutingPlan audio_plan_;
@@ -1122,6 +1104,7 @@ private:
   // Written by the window thread, read by pipe threads: atomics like their raw inputs above.
   std::atomic<float> level_desktop_{0.0f};
   std::atomic<float> level_mic_{0.0f};
+  std::array<std::atomic<float>, kAudioOutputMax> level_outputs_{};
   // The device each live source is bound to: a fader move must not recreate it.
   std::string desktop_device_;
   std::string mic_device_;

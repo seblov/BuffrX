@@ -215,6 +215,8 @@ void UiHost::frame() {
   store_.active = any_visible();
   store_.desktop_level = desktop_level_;
   store_.mic_level = mic_level_;
+  for (int i = 0; i < output_level_count_; ++i) store_.output_levels[static_cast<size_t>(i)] = output_levels_[static_cast<size_t>(i)];
+  store_.output_level_count = output_level_count_;
   if (main_) draw_window(*main_, false);
   if (tray_) draw_window(*tray_, false);
 
@@ -557,9 +559,11 @@ void UiHost::on_close(GLFWwindow* handle) {
 }
 void UiHost::on_framebuffer_size(GLFWwindow*, int, int) {}
 
-void UiHost::set_audio_levels(float desktop, float mic) {
+void UiHost::set_audio_levels(float desktop, float mic, const std::vector<float>& outputs) {
   desktop_level_ = desktop;
   mic_level_ = mic;
+  output_level_count_ = std::min(static_cast<int>(outputs.size()), static_cast<int>(output_levels_.size()));
+  for (int i = 0; i < output_level_count_; ++i) output_levels_[static_cast<size_t>(i)] = outputs[static_cast<size_t>(i)];
 }
 bool UiHost::audio_meter_visible() const { return any_visible(); }
 

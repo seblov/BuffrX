@@ -13,7 +13,7 @@
 // the preview then monitors the sources alone (never the mix as well, which would double every sound),
 // and the export rebuilds track 1 so an ordinary player hears the edit.
 
-export type AudioRole = 'mix' | 'desktop' | 'microphone' | 'application' | 'combined' | 'empty' | 'track' | ''
+export type AudioRole = 'mix' | 'desktop' | 'microphone' | 'output' | 'application' | 'combined' | 'empty' | 'track' | ''
 
 /** One audio track of a source, as the engine reports it and the editor holds it. */
 export interface AudioTrack {
@@ -175,6 +175,7 @@ export function trackName(track: AudioTrack | undefined, index: number): string 
   switch (track.role) {
     case 'desktop': return 'Desktop'
     case 'microphone': return 'Microphone'
+    case 'output': return 'Output'
     case 'application': return 'Application'
     case 'combined': return 'Combined'
     case 'empty': return 'Empty'

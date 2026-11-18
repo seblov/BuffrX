@@ -49,19 +49,13 @@ struct Advanced {
   bool capture = false, audio = false, encoder = false, storage = false;
 };
 
-// The expanded audio mixer (the deck's AUDIO pane, ui_live.cpp): its own picker snapshot and timers, so the
-// settings page and the panel never share a programme list or a hold. Read only while the mixer is on screen.
+// The expanded audio mixer (the deck's AUDIO pane, ui_live.cpp): automatic lanes' order and the
+// sessions it reads for their meters. Read only while the mixer is on screen.
 struct AudioMixerState {
-  bool pick = false;         // the app list is showing instead of the strips
-  int pick_replace = -1;     // -1: add; otherwise the slot a pick replaces
-  bool reopen = false;       // a pick was asked from inside the popup: open it again with the list
-  Json programs;             // sources.windows, one row per program
-  Json sessions;             // audio.sessions: each program's measured activity
-  std::vector<std::string> order;  // the exes in draw order, frozen while the pointer is in the list
-  std::string search;
-  uint32_t programs_at = 0, sessions_at = 0, order_at = 0, activity_at = 0;
-  bool programs_loading = false, sessions_loading = false;
-  bool first = true;         // true until the first list arrives: the only spinner
+  bool reopen = false;       // a press asked for the mixer from elsewhere: open it again
+  Json sessions;             // audio.sessions: each automatic program's measured activity
+  uint32_t sessions_at = 0, activity_at = 0;
+  bool sessions_loading = false;
   // Automatic app audio: the lanes' draw order (frozen while a hand is in the mixer), the Other group's
   // members' order, and whether that member list is open. Keys are exe keys or "other", never an index.
   std::vector<std::string> lane_order, member_order;
@@ -242,20 +236,8 @@ struct PanelState {
   bool report_busy = false;  // Settings > System > Support: the compatibility report is being made (about 10 s with the buffer on)
   uint32_t windows_at = 0;  // when the window list was last read for the capture picker
   bool picking_window = false;
-  // Settings > Audio's application picker. Its own snapshot and timers: the rows stay on screen while a
-  // refresh runs (only the first load draws a spinner), and the order is frozen while the pointer, a key
-  // or the wheel is in it, so a program that starts playing cannot make the row under the pointer jump.
-  bool picking_audio_app = false;
-  int audio_replace_slot = -1;  // -1: add new apps; otherwise the slot whose app a pick replaces
-  Json audio_programs;          // sources.windows, deduplicated per program on the way to the rows
-  Json audio_sessions;          // audio.sessions: each program's measured peak, read only while open
-  std::vector<std::string> audio_order;  // the exes in the order the rows are drawn, frozen on activity
-  std::vector<std::string> audio_picked;  // exes ticked for one Apply (add mode)
+  // Settings > Audio's output picker: a device row is a straight list, no snapshot or ordering state.
   uint32_t audio_meter_until = 0;         // while a speaker on the page sounds: ask for a frame 8 times a second
-  std::string audio_search;
-  uint32_t audio_programs_at = 0, audio_sessions_at = 0, audio_order_at = 0, audio_activity_at = 0;
-  bool audio_programs_loading = false, audio_sessions_loading = false;
-  bool audio_programs_first = false;  // true until the first list has arrived: the only spinner
   std::string exclusions_text;
   std::string performance_text;
   std::string filename_format;     // Settings, Storage: the name pattern being typed

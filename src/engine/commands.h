@@ -305,17 +305,9 @@ private:
   uint32_t idle_sample_ms_ = 0;     // the last foreground read while nothing wanted frames
   uint32_t alive_checked_ms_ = 0;
   bool alive_cached_ = false;
-  // The Current game audio slot follows the game BuffrX captures. A pinned game has no hook state to read,
-  // so its program is looked for once a second; an auto-captured one already has active_game_alive's cache.
-  uint32_t game_audio_checked_ms_ = 0;
-  bool game_audio_alive_ = false;
   // One card per unresolved audio problem (audio_health.h), never one per tick.
   AudioNoticeState audio_notice_;
-  // What the last audio poll resolved, for status.audio: the game whose picture the capture covers, which is what
-  // the policy judges (never the Current game routing target), and when it was polled (the notice's grace is
-  // measured against that clock). The page's persistent line uses the same facts, so it says the same thing after
-  // the card is gone.
-  std::string audio_warning_game_;
+  // When the last audio poll ran: the notice's grace is measured against this clock.
   uint32_t audio_poll_ms_ = 0;
   // Automatic audio's event watcher. It runs only while the buffer/manual/Timeline wants sound, so an
   // idle engine starts no thread and opens no device. A snapshot is applied when its generation moves or

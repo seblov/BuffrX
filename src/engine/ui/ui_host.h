@@ -85,7 +85,7 @@ public:
   bool any_visible() const;
   // Window thread only: the deck or Settings > Audio is visible and needs live levels.
   bool audio_meter_visible() const;
-  void set_audio_levels(float desktop, float mic);
+  void set_audio_levels(float desktop, float mic, const std::vector<float>& outputs);
   // Called by the window-thread status tick, including while no window is visible.
   void set_buffer_active(bool active) { buffer_active_.store(active, std::memory_order_relaxed); }
   // From any thread: a BuffrX window (the panel or the tray panel) is visible, not minimized and is the window the

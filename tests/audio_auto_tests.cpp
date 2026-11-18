@@ -381,26 +381,15 @@ int test_audio_auto() {
            "a member's effective level is its saved gain times the group's, and either mute silences it");
   }
 
-  // Configuration: an existing desktop/apps file migrates to automatic, keeps the old mode and routes,
-  // and seeds preferences from the routes' saved gain and mute.
+  // Configuration: an existing apps file migrates to automatic capture. Its old routes named programs,
+  // not outputs, so they seed nothing.
   {
     bx::Config config;
     config.config_version = 12;
     config.audio_capture_mode = "apps";
-    bx::AudioApp app;
-    app.window = "Discord:Chrome_WidgetWin_1:Discord.exe";
-    app.exe = "Discord.exe";
-    app.title = "Discord";
-    app.volume = 0.35;
-    app.muted = true;
-    config.audio_apps = {app};
-    bx::migrate_config(config, true);
+    bx::migrate_config(config);
     expect(failures, config.audio_capture_mode == "auto", "an existing file moves to automatic capture");
-    expect(failures, config.audio_capture_legacy_mode == "apps", "its old mode is kept for compatibility");
-    expect(failures, config.audio_apps.size() == 1, "its routes are untouched");
-    const auto pref = config.audio_app_prefs.find("discord.exe");
-    expect(failures, pref != config.audio_app_prefs.end() && pref->second.volume == 0.35 && pref->second.muted,
-           "a route's gain and mute seed its automatic preference");
+    expect(failures, config.audio_app_prefs.empty(), "an old route does not invent a preference");
   }
 
   // A preference patch merges fields and keys: changing one fader never writes over another program, or
@@ -442,7 +431,7 @@ int test_audio_auto() {
     config.mic_enabled = true;
     config.audio_app_prefs["saved.exe"].muted = true;
     expect(failures, bx::audio_track_count(config) == 1, "all sound together builds one track");
-    config.audio_capture_mode = "apps";
+    config.audio_capture_mode = "outputs";
     config.audio_tracks = 3;
     config.separate_tracks = true;
     expect(failures, bx::audio_track_count(config) == 3, "manual restores separate tracks after together");

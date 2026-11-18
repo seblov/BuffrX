@@ -1329,10 +1329,16 @@ bool UiHost::audio_meter_visible() const {
   return audio_meter_wanted(visible, minimized, view, visible && main_->closing);
 }
 
-void UiHost::set_audio_levels(float desktop, float mic) {
-  if (store_.desktop_level == desktop && store_.mic_level == mic) return;
+void UiHost::set_audio_levels(float desktop, float mic, const std::vector<float>& outputs) {
+  const int count = std::min(static_cast<int>(outputs.size()), UiStore::kOutputLevelSlots);
+  bool outputs_same = store_.output_level_count == count;
+  for (int i = 0; outputs_same && i < count; ++i)
+    outputs_same = store_.output_levels[static_cast<size_t>(i)] == outputs[static_cast<size_t>(i)];
+  if (store_.desktop_level == desktop && store_.mic_level == mic && outputs_same) return;
   store_.desktop_level = desktop;
   store_.mic_level = mic;
+  for (int i = 0; i < count; ++i) store_.output_levels[static_cast<size_t>(i)] = outputs[static_cast<size_t>(i)];
+  store_.output_level_count = count;
   store_.dirty = true;
   wake();
 }

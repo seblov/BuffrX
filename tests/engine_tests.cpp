@@ -841,13 +841,12 @@ void test_audio_prefs_persistence() {
         "the same file still loads its prefs after the refused write");
   SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
 
-  // A file written before automatic capture: the migration keeps the prefs it already carries and seeds
-  // only the programs its old routes list.
+  // A file written before automatic capture: the migration keeps the automatic preferences it already
+  // carries. Old application routes are not converted into output devices: they name programs, not outputs.
   const std::string old_path = temp_directory() + "\\config-audio-prefs-old.json";
   bx::Json old_file = bx::config_to_json(config);
   old_file.set("config_version", bx::Json(11));
   old_file.set("audio_capture_mode", bx::Json("apps"));
-  old_file.set("audio_capture_legacy_mode", bx::Json(""));
   bx::Json routes = bx::Json::array();
   bx::Json route = bx::Json::object();
   route.set("window", bx::Json("Discord:Chrome_WidgetWin_1:Discord.exe"));
@@ -865,14 +864,12 @@ void test_audio_prefs_persistence() {
   check(bx::write_file_atomic(old_path, old_file.dump()), "a version 11 config is written");
   bx::Config migrated;
   check(bx::load_config(old_path, migrated, error), "a version 11 config loads");
-  check(migrated.config_version == bx::Config::kConfigVersion && migrated.audio_capture_mode == "auto" &&
-            migrated.audio_capture_legacy_mode == "apps",
-        "a version 11 file moves to automatic capture and keeps the mode it recorded with");
+  check(migrated.config_version == bx::Config::kConfigVersion && migrated.audio_capture_mode == "auto",
+        "a version 11 file moves to automatic capture");
   check(migrated.audio_app_prefs["teams.exe"].volume == 0.6 && migrated.audio_app_prefs["teams.exe"].muted,
         "the prefs the file already carried are kept by the migration");
-  check(migrated.audio_app_prefs["discord.exe"].volume == 1.0, "a route with no saved preference seeds one");
-  check(migrated.audio_app_prefs["teams.exe"].volume == 0.6 && migrated.audio_app_prefs["teams.exe"].muted,
-        "a preference the file already carried is never overwritten by a route");
+  check(migrated.audio_app_prefs.count("discord.exe") == 0 && migrated.audio_outputs.empty(),
+        "an old application route is not read as an output or a preference");
   check(bx::save_config(old_path, migrated, error), "the migrated config saves");
   bx::Config migrated_again;
   check(bx::load_config(old_path, migrated_again, error) &&
@@ -880,36 +877,28 @@ void test_audio_prefs_persistence() {
         "the migrated prefs survive the save that follows the migration");
 }
 
-// Application audio and the mixer plan (audio_routing.h): four slots on fixed tracks, the Current game
-// slot, the labels a multitrack file carries, legacy files, and the migration of an existing config.
+// Output audio and the mixer plan (audio_routing.h): four slots on fixed tracks, the labels a multitrack
+// file carries, legacy files, and the migration of an existing config.
 void test_audio_routing() {
   std::printf("audio routing\n");
-  bx::AudioApp discord;
-  discord.window = "Discord:Chrome_WidgetWin_1:Discord.exe";
-  discord.exe = "Discord.exe";
-  discord.title = "Discord";
-  bx::AudioApp game;
-  game.window = "Counter-Strike 2:SDL_app:cs2.exe";
-  game.exe = "cs2.exe";
-  game.title = "Counter-Strike 2";
-  bx::AudioApp current;
-  current.kind = bx::kAudioGameKind;
-  current.title = "Current game";
+  bx::AudioOutput speakers;
+  speakers.device = "speakers-endpoint";
+  speakers.name = "Headphones";
+  bx::AudioOutput dock;
+  dock.device = "dock-endpoint";
+  dock.name = "Dock";
 
-  // Duplicates by executable, an entry with no window and a second game slot would each build something
-  // nobody reads or capture one program twice. A file may hold more than four slots; it is read whole.
-  std::vector<bx::AudioApp> raw{discord, game, discord};
-  raw.push_back(bx::AudioApp{"x", "cs2.exe", "second cs2", "", 5});
-  raw.push_back(bx::AudioApp{"", "ghost.exe", "", "", 2});
-  raw.push_back(current);
-  raw.push_back(current);
-  const std::vector<bx::AudioApp> normalized = bx::normalize_audio_apps(raw);
-  check(normalized.size() == 3, "a duplicate executable, a route without a window and a second game slot are dropped");
-  check(bx::audio_app_is_game(normalized[2]), "the Current game slot is kept as one entry");
-  std::vector<bx::AudioApp> many;
-  for (int i = 0; i < 20; ++i) many.push_back(bx::AudioApp{"w" + std::to_string(i), "a" + std::to_string(i) + ".exe", "A", "", 2});
-  check(bx::normalize_audio_apps(many).size() == static_cast<size_t>(bx::kAudioAppStoredMax),
-        "a hand-edited file is read up to the stored ceiling, not truncated to the four slots");
+  // Duplicates by device and an entry with no device would each build something nobody records.
+  std::vector<bx::AudioOutput> raw{speakers, dock, speakers};
+  raw.push_back(bx::AudioOutput{"", "No device", 1.0, false});
+  const std::vector<bx::AudioOutput> normalized = bx::normalize_audio_outputs(raw);
+  check(normalized.size() == 2 && normalized[0].device == "speakers-endpoint" &&
+            normalized[1].device == "dock-endpoint",
+        "a duplicate output and an entry without a device are dropped");
+  std::vector<bx::AudioOutput> many;
+  for (int i = 0; i < 8; ++i) many.push_back(bx::AudioOutput{"device" + std::to_string(i), "Output", 1.0, false});
+  check(bx::normalize_audio_outputs(many).size() == static_cast<size_t>(bx::kAudioOutputMax),
+        "a hand-edited file keeps only the four slots this build records");
 
   // An existing config: the desktop loopback and the microphone keep exactly the tracks they always had.
   bx::Config legacy;
@@ -920,131 +909,47 @@ void test_audio_routing() {
   check(before.track_count == 3 && before.desktop_captured, "an old config keeps its three tracks and the desktop");
   check(before.desktop_mixers == ((1u << 0) | (1u << 1)), "desktop keeps the mix and track 2");
   check(before.mic_mixers == ((1u << 0) | (1u << 2)), "the microphone keeps the mix and track 3");
-  check(bx::plan_audio_routing(bx::Config{}).desktop_captured, "a config with no app routes captures the desktop");
+  check(bx::plan_audio_routing(bx::Config{}).desktop_captured, "a config with no outputs captures the desktop");
 
-  // Four slots: Discord on 3 and the game on 4 by position, each on its own mixer bit, both in the mix, the
-  // desktop loopback off. The stored `track` values are irrelevant: a four-route file's order was 3,4,5,6.
+  // Two outputs: each on its own track, both in the mix, the desktop loopback off, the microphone on 2.
   bx::Config routed = legacy;
-  routed.audio_capture_mode = "apps";
-  routed.audio_apps = {discord, game};
+  routed.audio_capture_mode = "outputs";
+  routed.audio_outputs = {speakers, dock};
   const bx::AudioRoutingPlan plan = bx::plan_audio_routing(routed);
-  check(plan.track_count == 4, "two slots ask for four encoders: mix, microphone and both apps");
+  check(plan.track_count == 4, "two outputs ask for four encoders: mix, microphone and both outputs");
   check(!plan.desktop_captured && plan.desktop_mixers == (1u << 0),
-        "app tracks turn the desktop loopback off instead of recording those apps twice");
-  check(plan.app_mixers.size() == 2 && plan.app_mixers[0] == ((1u << 0) | (1u << 2)) &&
-            plan.app_mixers[1] == ((1u << 0) | (1u << 3)),
-        "each app writes the mix and only the track of its slot");
+        "per-output tracks turn the single desktop loopback off");
+  check(plan.output_mixers.size() == 2 && plan.output_mixers[0] == ((1u << 0) | (1u << 2)) &&
+            plan.output_mixers[1] == ((1u << 0) | (1u << 3)),
+        "each output writes the mix and only the track of its slot");
   check(plan.mic_mixers == ((1u << 0) | (1u << 1)) && plan.tracks[1].role == "microphone" &&
             plan.tracks[1].title == "BuffrX Microphone",
-        "with apps separate the microphone takes the free track 2, so 3 and 4 stay independent");
-  check(plan.tracks[0].title == "BuffrX Mix" && plan.tracks[2].title == "BuffrX Discord" &&
-            plan.tracks[3].title == "BuffrX cs2",
+        "the microphone takes the free track 2, so 3 and 4 stay independent");
+  check(plan.tracks[0].title == "BuffrX Mix" && plan.tracks[2].title == "BuffrX Headphones" &&
+            plan.tracks[3].title == "BuffrX Dock" && plan.tracks[2].role == "output",
         "each track has a stable label a file can carry");
-  check(plan.tracks[0].sources.size() == 3, "the mix lists the microphone and both apps");
-  bool desktop_in_app_plan = false;
-  for (const std::string& source : plan.tracks[0].sources) desktop_in_app_plan = desktop_in_app_plan || source == "desktop";
-  check(!desktop_in_app_plan, "nothing claims the desktop is in the mix while apps are separate");
+  check(plan.tracks[0].sources.size() == 3, "the mix lists the microphone and both outputs");
+  bool desktop_in_output_plan = false;
+  for (const std::string& source : plan.tracks[0].sources)
+    desktop_in_output_plan = desktop_in_output_plan || source == "desktop";
+  check(!desktop_in_output_plan, "nothing claims the desktop is in the mix while outputs are separate");
+  check(plan.tracks[2].sources.size() == 1 && plan.tracks[2].sources[0] == "output:speakers-endpoint",
+        "an output track names the endpoint it records");
 
-  // A four-route file written by the old build: same programs, same order, same tracks 3..6.
+  // Four outputs: tracks 3..6, all in the mix.
   bx::Config four = routed;
-  four.audio_apps = {discord, game,
-                     bx::AudioApp{"w", "spotify.exe", "Spotify", "", 5},
-                     bx::AudioApp{"w", "chrome.exe", "Chrome", "", 6}};
+  four.audio_outputs = {speakers, dock,
+                        bx::AudioOutput{"hdmi", "TV", 1.0, false},
+                        bx::AudioOutput{"default", "System default", 1.0, false}};
   const bx::AudioRoutingPlan four_plan = bx::plan_audio_routing(four);
-  check(four_plan.apps.size() == 4 && four_plan.apps[0].track == 3 && four_plan.apps[3].track == 6 &&
-            four_plan.track_count == 6,
-        "an existing four-route config records the same apps on the same tracks 3..6");
+  check(four_plan.outputs.size() == 4 && four_plan.track_count == 6 && four_plan.tracks[5].title == "BuffrX System default",
+        "an existing four-output config records the same devices on the same tracks 3..6");
 
-  // Automatic assignment ignores a stored number: the order is the slot, never a hand-edited track.
-  bx::Config reordered = routed;
-  reordered.audio_apps[0].track = 6;
-  reordered.audio_apps[1].track = 3;
-  const bx::AudioRoutingPlan reordered_plan = bx::plan_audio_routing(reordered);
-  check(reordered_plan.apps[0].track == 3 && reordered_plan.apps[1].track == 4,
-        "a slot's track follows its position, not a stored number");
-
-  // Legacy files: entries past the fourth are kept in the file, reported as not recorded and never built.
-  bx::Config over = four;
-  over.audio_apps.push_back(bx::AudioApp{"w", "extra.exe", "Extra", "", 4});
-  over.audio_apps.push_back(bx::AudioApp{"w", "extra2.exe", "Extra 2", "", 5});
-  const bx::AudioRoutingPlan over_plan = bx::plan_audio_routing(over);
-  check(over_plan.apps.size() == 4 && bx::over_limit_audio_apps(over).size() == 2,
-        "a file with more than four slots records four and reports the rest");
-  check(over_plan.track_count == 6, "the extra legacy entries reserve no encoder");
-  check(bx::effective_audio_apps(over).size() == 4 && over.audio_apps.size() == 6,
-        "the plan takes four slots and the stored list keeps every entry");
-
-  // The Current game slot: one slot, on a fixed track, that is never filled with the desktop and whose label
-  // stays generic while the game changes, so a replay that spans two games is still described truthfully.
-  bx::Config with_game = routed;
-  with_game.audio_apps = {discord, current};
-  bx::GameAudioTarget target;
-  target.active = true;
-  target.exe = "cs2.exe";
-  target.window = "Counter-Strike 2:SDL_app:cs2.exe";
-  target.title = "Counter-Strike 2";
-  const bx::AudioRoutingPlan game_plan = bx::plan_audio_routing(with_game, target);
-  check(game_plan.game_slot == 1 && game_plan.game_track == 4, "the Current game slot takes the track of its position");
-  check(game_plan.tracks[3].title == "BuffrX Game" && game_plan.tracks[3].role == "application" &&
-            game_plan.tracks[3].sources.size() == 1 && game_plan.tracks[3].sources[0] == "app:game",
-        "the game track is labelled generically and named as this product's game source");
-  check(game_plan.tracks[0].sources.size() == 3, "the game is part of the mix like any other slot");
-  bx::GameAudioTarget other = target;
-  other.exe = "fortnite.exe";
-  other.window = "Fortnite:UnrealWindow:fortnite.exe";
-  other.title = "Fortnite";
-  const bx::AudioRoutingPlan other_plan = bx::plan_audio_routing(with_game, other);
-  check(other_plan.game_track == 4 && other_plan.tracks[3].title == "BuffrX Game",
-        "another game keeps the same logical game track and the same generic label");
-  const bx::AudioRoutingPlan waiting = bx::plan_audio_routing(with_game, bx::GameAudioTarget{});
-  check(waiting.game_slot == 1 && waiting.track_count == 4 &&
-            waiting.tracks[3].role == "application" && waiting.tracks[3].title == "BuffrX Game" &&
-            waiting.tracks[3].sources.size() == 1 && waiting.tracks[3].sources[0] == "app:game",
-        "a waiting game slot keeps its lane identity: the label is fixed when the encoders start, not when a game appears");
-  check(waiting.apps[1].exe.empty(), "a waiting game slot has no source identity to bind");
-  bool game_in_mix = false;
-  for (const std::string& source : waiting.tracks[0].sources) game_in_mix = game_in_mix || source == "app:game";
-  check(game_in_mix, "the game lane is part of the mix from the first frame, so a late game is never hidden from an editor");
-  bool desktop_for_game = false;
-  for (const std::string& source : waiting.tracks[0].sources) desktop_for_game = desktop_for_game || source == "desktop";
-  check(!desktop_for_game, "a waiting game slot never falls back to the desktop");
-
-  // No game, then game A, then game B, then no game again: every file describes the same lanes, so chunks
-  // joined across those transitions carry one honest layout instead of reopening as imports.
-  {
-    const std::string root = temp_directory() + "\\audio-game-transition";
-    CreateDirectoryA(root.c_str(), nullptr);
-    const bx::AudioRoutingPlan plans[3] = {waiting, game_plan, other_plan};
-    std::vector<bx::AudioLayout> layouts;
-    for (int i = 0; i < 3; ++i) {
-      const std::string file = root + "\\part" + std::to_string(i) + ".mp4";
-      bx::write_file_atomic(file, "chunk " + std::to_string(i));
-      check(bx::write_audio_sidecar(file, plans[i]), "each segment of a game transition writes its labels");
-      layouts.push_back(bx::read_audio_layout(file, plans[i].track_count));
-    }
-    check(layouts[0].buffrx && layouts[1].buffrx && layouts[2].buffrx &&
-              bx::same_audio_layout(layouts[0], layouts[1]) && bx::same_audio_layout(layouts[1], layouts[2]),
-          "a waiting, a captured and a changed game all describe the same lanes");
-    const bx::JoinAudioLayout joined = bx::join_audio_layout(layouts);
-    check(joined.carries && bx::same_audio_layout(joined.layout, layouts[0]),
-          "a save across game changes keeps one layout, so the game stem is not hidden and not doubled");
-  }
-
-  // A game already selected by name: the Current game lane makes no second capture.
-  bx::Config named_game = with_game;
-  named_game.audio_apps = {discord, current, bx::AudioApp{"w", "cs2.exe", "Counter-Strike 2", "", 0}};
-  const bx::AudioRoutingPlan named_plan = bx::plan_audio_routing(named_game, target);
-  check(named_plan.game_covered_slot == 2 && named_plan.apps[1].exe.empty(),
-        "a game selected by name covers the Current game slot, which then makes no source");
-  check(named_plan.tracks[4].title == "BuffrX cs2" && named_plan.tracks[3].title == "BuffrX Game" &&
-            named_plan.tracks[3].sources.size() == 1 && named_plan.tracks[3].sources[0] == "app:game",
-        "the captured program is recorded once, by its named lane; the game lane stays a silent stem");
-
-  // Performance mode owns a single mixed track; app routes stay stored and are ignored while it runs.
+  // Performance mode owns a single mixed track; saved outputs stay stored and are ignored while it runs.
   const bx::Config performed = bx::apply_performance_plan(routed, bx::performance_plan());
-  check(performed.audio_apps.empty() && performed.audio_tracks == 1 && !performed.separate_tracks &&
+  check(performed.audio_outputs.empty() && performed.audio_tracks == 1 && !performed.separate_tracks &&
             bx::plan_audio_routing(performed).desktop_captured,
-        "Performance mode records one mixed track with the desktop back, not split app tracks");
+        "Performance mode records one mixed track with the desktop back, not split output tracks");
 
   // Disabled devices keep their track assignments so enabling them live does not change the layout.
   bx::Config quiet = legacy;
@@ -1062,183 +967,173 @@ void test_audio_routing() {
             (bx::config_change_bits(two_tracks, two_with_mic) & bx::kConfigRebuilds),
         "enabling a microphone on a two-track layout reserves its own track and rebuilds safely");
 
-  // One app slot needs track 3 even when the explicit count says one encoder.
-  bx::Config one_app = legacy;
-  one_app.audio_capture_mode = "apps";
-  one_app.audio_apps = {discord};
-  one_app.separate_tracks = false;
-  one_app.audio_tracks = 1;
-  check(bx::audio_track_count(one_app) == 3, "one app slot reserves mix, microphone and its own track");
-  check(bx::plan_audio_routing(one_app).tracks[1].role == "microphone" &&
-            bx::plan_audio_routing(one_app).tracks[2].title == "BuffrX Discord",
-        "adding an app isolates the microphone even when the old setting was mixed");
+  // One output needs track 3 even when the explicit count says one encoder.
+  bx::Config one_output = legacy;
+  one_output.audio_capture_mode = "outputs";
+  one_output.audio_outputs = {speakers};
+  one_output.separate_tracks = false;
+  one_output.audio_tracks = 1;
+  check(bx::audio_track_count(one_output) == 3, "one output slot reserves mix, microphone and its own track");
+  check(bx::plan_audio_routing(one_output).tracks[1].role == "microphone" &&
+            bx::plan_audio_routing(one_output).tracks[2].title == "BuffrX Headphones",
+        "adding an output isolates the microphone even when the old setting was mixed");
 
-  // The config file and the pipe: slots survive a round trip, normalize on the way in, and an old file has none.
+  // The config file and the pipe: outputs survive a round trip, normalize on the way in, and an old file has none.
   bx::Config stored = routed;
-  stored.audio_apps.push_back(discord);  // a duplicate must not survive the file either
+  stored.audio_outputs.push_back(speakers);  // a duplicate must not survive the file either
   bx::Config back;
   bx::config_from_json(bx::config_to_json(stored), back);
-  check(back.audio_apps.size() == 2 && back.audio_apps[0].exe == "Discord.exe" && back.audio_apps[1].exe == "cs2.exe",
-        "application slots survive a config round trip");
-  bx::Config stored_game = with_game;
-  bx::Config game_back;
-  bx::config_from_json(bx::config_to_json(stored_game), game_back);
-  check(game_back.audio_apps.size() == 2 && bx::audio_app_is_game(game_back.audio_apps[1]),
-        "the Current game slot survives a config round trip as a game slot");
+  check(back.audio_outputs.size() == 2 && back.audio_outputs[0].device == "speakers-endpoint" &&
+            back.audio_outputs[1].device == "dock-endpoint",
+        "output slots survive a config round trip");
   bx::Json old = bx::config_to_json(legacy);
-  old.erase("audio_apps");
+  old.erase("audio_outputs");
   bx::Config old_back;
   bx::config_from_json(old, old_back);
-  check(old_back.audio_apps.empty() && old_back.separate_tracks && old_back.audio_tracks == 3,
-        "a file written before app slots keeps its old audio layout exactly");
+  check(old_back.audio_outputs.empty() && old_back.separate_tracks && old_back.audio_tracks == 3,
+        "a file written before output slots keeps its old audio layout exactly");
   bx::Json nested = bx::Json::object();
-  nested.set("apps", bx::audio_apps_json(routed.audio_apps));
+  nested.set("audio_outputs", bx::audio_outputs_json(routed.audio_outputs));
   bx::Config piped;
   bx::config_apply_audio(nested, piped);
-  check(piped.audio_apps.size() == 2 && piped.audio_apps[1].exe == "cs2.exe",
-        "audio.set accepts the apps field audio.get returns");
+  check(piped.audio_outputs.size() == 2 && piped.audio_outputs[1].device == "dock-endpoint",
+        "audio.set accepts the outputs field audio.get returns");
 
   bx::Config swapped = routed;
-  std::swap(swapped.audio_apps[0], swapped.audio_apps[1]);
+  std::swap(swapped.audio_outputs[0], swapped.audio_outputs[1]);
   check((bx::config_change_bits(routed, swapped) & bx::kConfigRebuilds) != 0,
         "reordering the slots rebuilds the audio encoders");
   bx::Config retitled = routed;
-  retitled.audio_apps[0].title = "Discord | #general";
+  retitled.audio_outputs[0].name = "Headphones (USB)";
   check((bx::config_change_bits(routed, retitled) & bx::kConfigRebuilds) == 0,
-        "a window title changing does not rebuild the buffer");
+        "a device's saved name changing does not rebuild the buffer");
+  bx::Config quieter = routed;
+  quieter.audio_outputs[0].volume = 0.4;
+  quieter.audio_outputs[1].muted = true;
+  check((bx::config_change_bits(routed, quieter) & bx::kConfigRebuilds) == 0,
+        "a fader or mute change does not rebuild the buffer");
 
-  // The recording mode: Everything records the output loopback and keeps saved slots for later; they must
-  // not add encoders, sources or a rebuild while they are not recording.
+  // The recording mode: All sound together records the output loopback and keeps saved slots for later; they
+  // must not add encoders, sources or a rebuild while they are not recording.
   bx::Config kept = legacy;
-  kept.audio_apps = {discord, game};
+  kept.audio_outputs = {speakers, dock};
   const bx::AudioRoutingPlan kept_plan = bx::plan_audio_routing(kept);
-  check(kept.audio_capture_mode == "desktop" && kept_plan.desktop_captured && kept_plan.apps.empty(),
-        "desktop mode records the loopback even with saved app slots");
+  check(kept.audio_capture_mode == "desktop" && kept_plan.desktop_captured && kept_plan.outputs.empty(),
+        "desktop mode records the loopback even with saved output slots");
   check(kept_plan.track_count == 3 && kept_plan.desktop_mixers == ((1u << 0) | (1u << 1)) &&
             kept_plan.mic_mixers == ((1u << 0) | (1u << 2)),
         "desktop mode keeps the desktop on track 2 and the microphone on 3");
   bx::Config inactive;
   inactive.audio_tracks = 1;
-  inactive.audio_apps.push_back(bx::AudioApp{"x", "cs2.exe", "CS2", "", 5});
+  inactive.audio_outputs.push_back(dock);
   check(bx::audio_track_count(inactive) == 1 && bx::plan_audio_routing(inactive).track_count == 1,
-        "a saved slot does not build encoders while desktop mode records");
+        "a saved output does not build encoders while desktop mode records");
   bx::Config inactive_more = inactive;
-  inactive_more.audio_apps.push_back(discord);
+  inactive_more.audio_outputs.push_back(speakers);
   check((bx::config_change_bits(inactive, inactive_more) & bx::kConfigRebuilds) == 0,
-        "editing saved slots in desktop mode does not restart the buffer");
-  bx::Config switch_to_apps = inactive;
-  switch_to_apps.audio_capture_mode = "apps";
-  check((bx::config_change_bits(inactive, switch_to_apps) & bx::kConfigRebuilds) != 0,
-        "switching to Selected apps rebuilds the audio encoders");
+        "editing saved outputs in desktop mode does not restart the buffer");
+  bx::Config switch_to_outputs = inactive;
+  switch_to_outputs.audio_capture_mode = "outputs";
+  check((bx::config_change_bits(inactive, switch_to_outputs) & bx::kConfigRebuilds) != 0,
+        "switching to Manual rebuilds the audio encoders");
   check(bx::config_change_bits(inactive, inactive) == 0, "an unchanged desktop config changes nothing");
 
-  // Apps mode with no selection never falls back to the desktop: only the microphone is recorded.
-  bx::Config no_apps;
-  no_apps.audio_capture_mode = "apps";
-  no_apps.audio_tracks = 3;
-  no_apps.mic_enabled = true;
-  const bx::AudioRoutingPlan no_apps_plan = bx::plan_audio_routing(no_apps);
-  check(!no_apps_plan.desktop_captured && no_apps_plan.apps.empty(),
-        "Selected apps with nothing chosen does not silently capture the desktop");
-  check(no_apps_plan.desktop_mixers == (1u << 0), "the unused desktop loopback writes no track");
-  check(no_apps_plan.mic_mixers == ((1u << 0) | (1u << 1)) && no_apps_plan.tracks[1].role == "microphone",
-        "with no apps the microphone takes track 2 and still records");
+  // Outputs mode with no selection never falls back to the desktop: only the microphone is recorded.
+  bx::Config no_outputs;
+  no_outputs.audio_capture_mode = "outputs";
+  no_outputs.audio_tracks = 3;
+  no_outputs.mic_enabled = true;
+  const bx::AudioRoutingPlan no_outputs_plan = bx::plan_audio_routing(no_outputs);
+  check(!no_outputs_plan.desktop_captured && no_outputs_plan.outputs.empty(),
+        "Manual with nothing chosen does not silently capture the desktop");
+  check(no_outputs_plan.desktop_mixers == (1u << 0), "the unused desktop loopback writes no track");
+  check(no_outputs_plan.mic_mixers == ((1u << 0) | (1u << 1)) && no_outputs_plan.tracks[1].role == "microphone",
+        "with no outputs the microphone takes track 2 and still records");
   bool desktop_in_empty = false;
-  for (const std::string& source : no_apps_plan.tracks[0].sources) desktop_in_empty = desktop_in_empty || source == "desktop";
-  check(!desktop_in_empty, "the mix of an empty app layout names no desktop source");
+  for (const std::string& source : no_outputs_plan.tracks[0].sources) desktop_in_empty = desktop_in_empty || source == "desktop";
+  check(!desktop_in_empty, "the mix of an empty output layout names no desktop source");
 
-  // Switching back and forth keeps the saved slots: only what records changes.
-  bx::Config back_to_apps = kept;
-  back_to_apps.audio_capture_mode = "apps";
-  check(bx::plan_audio_routing(back_to_apps).apps.size() == 2 &&
-            !bx::plan_audio_routing(back_to_apps).desktop_captured,
-        "choosing Selected apps again restores the saved slots");
+  // Switching back and forth keeps the saved outputs: only what records changes.
+  bx::Config back_to_outputs = kept;
+  back_to_outputs.audio_capture_mode = "outputs";
+  check(bx::plan_audio_routing(back_to_outputs).outputs.size() == 2 &&
+            !bx::plan_audio_routing(back_to_outputs).desktop_captured,
+        "choosing Manual again restores the saved outputs");
 
   // An unknown mode is not a fourth behaviour: it changes nothing, and a fresh config is desktop.
   bx::Json unknown_mode = bx::config_to_json(routed);
   unknown_mode.set("audio_capture_mode", bx::Json("everything"));
   bx::Config parsed_unknown = routed;
   bx::config_from_json(unknown_mode, parsed_unknown);
-  check(parsed_unknown.audio_capture_mode == "apps", "an unknown recording mode is ignored");
+  check(parsed_unknown.audio_capture_mode == "outputs", "an unknown recording mode is ignored");
   check(bx::Config{}.audio_capture_mode == "desktop", "a new config records desktop audio");
+  bx::Json legacy_mode = bx::config_to_json(routed);
+  legacy_mode.set("audio_capture_mode", bx::Json("apps"));
+  bx::Config parsed_legacy;
+  bx::config_apply_audio(legacy_mode, parsed_legacy);
+  check(parsed_legacy.audio_capture_mode == "outputs", "the old apps mode reads as output selection");
 
-  // The migration: a file with slots recorded them until now, so it starts in Selected apps; a file without
-  // slots starts in Everything; a file that already chose a mode keeps it.
+  // The migration: a manual apps file moves to outputs with the device it already used, so the move never
+  // leaves it silent. A file in any other mode is untouched by it.
   bx::Config old_routes;
-  old_routes.config_version = 9;
-  old_routes.audio_apps = {discord};
-  old_routes.audio_capture_mode = "desktop";
+  old_routes.config_version = 13;
+  old_routes.audio_capture_mode = "apps";
+  old_routes.desktop_device = "speakers-endpoint";
   bx::migrate_config(old_routes);
-  check(old_routes.audio_capture_mode == "auto" && old_routes.audio_capture_legacy_mode == "apps" &&
+  check(old_routes.audio_capture_mode == "outputs" && old_routes.audio_outputs.size() == 1 &&
+            old_routes.audio_outputs[0].device == "speakers-endpoint" &&
             old_routes.config_version == bx::Config::kConfigVersion,
-        "an existing config with app slots moves to automatic capture and keeps the old mode");
+        "an existing apps config moves to outputs with the device it already used");
   bx::Config old_plain;
-  old_plain.config_version = 9;
+  old_plain.config_version = 13;
+  old_plain.audio_capture_mode = "desktop";
   bx::migrate_config(old_plain);
-  check(old_plain.audio_capture_mode == "auto" && old_plain.audio_capture_legacy_mode == "desktop",
-        "an existing config without slots moves to automatic capture too");
+  check(old_plain.audio_capture_mode == "desktop" && old_plain.audio_outputs.empty(),
+        "a version 13 desktop config stays desktop and seeds no output");
   bx::Config chosen_mode;
-  chosen_mode.config_version = 10;
-  chosen_mode.audio_apps = {discord};
-  chosen_mode.audio_capture_mode = "desktop";
+  chosen_mode.config_version = 14;
+  chosen_mode.audio_capture_mode = "outputs";
   bx::migrate_config(chosen_mode);
-  check(chosen_mode.audio_capture_mode == "auto" && chosen_mode.audio_capture_legacy_mode == "desktop",
-        "a version 10 file moves to automatic capture with its old mode kept");
-  bx::Config older_choice;
-  older_choice.config_version = 9;
-  older_choice.audio_apps = {discord};
-  older_choice.audio_capture_mode = "desktop";
-  bx::migrate_config(older_choice, true);
-  check(older_choice.audio_capture_mode == "auto" && older_choice.audio_capture_legacy_mode == "desktop" &&
-            older_choice.config_version == bx::Config::kConfigVersion,
-        "a stored mode is kept as history when the file moves to automatic capture");
-  const std::string mode_path = temp_directory() + "\\config-audio-mode.json";
-  CreateDirectoryA(temp_directory().c_str(), nullptr);
-  bx::Json older_file = bx::config_to_json(older_choice);
-  older_file.set("config_version", bx::Json(9));  // what a downgraded or hand-edited file still says
-  bx::write_file_atomic(mode_path, older_file.dump());
-  bx::Config mode_from_disk;
-  std::string mode_error;
-  check(bx::load_config(mode_path, mode_from_disk, mode_error) && mode_from_disk.audio_capture_mode == "auto" &&
-            mode_from_disk.audio_apps.size() == 1,
-        "a file read from disk moves to automatic capture and its saved slots survive");
+  check(chosen_mode.audio_capture_mode == "outputs" && chosen_mode.audio_outputs.empty(),
+        "a version 14 file with a deliberately empty output list stays empty");
 
   // The mode rides the config file and the pipe beside the slots.
   bx::Config mode_back;
   bx::config_from_json(bx::config_to_json(kept), mode_back);
-  check(mode_back.audio_capture_mode == "desktop" && mode_back.audio_apps.size() == 2,
-        "the mode and its saved slots survive a config round trip");
+  check(mode_back.audio_capture_mode == "desktop" && mode_back.audio_outputs.size() == 2,
+        "the mode and its saved outputs survive a config round trip");
   bx::Json mode_patch = bx::Json::object();
-  mode_patch.set("audio_capture_mode", bx::Json("apps"));
+  mode_patch.set("audio_capture_mode", bx::Json("outputs"));
   bx::Config piped_mode;
   bx::config_apply_audio(mode_patch, piped_mode);
-  check(piped_mode.audio_capture_mode == "apps", "audio.set accepts the mode audio.get returns");
+  check(piped_mode.audio_capture_mode == "outputs", "audio.set accepts the mode audio.get returns");
 
   // Performance mode overrides the effective mode but leaves the stored choice and slots alone.
-  const bx::Config performed_apps = bx::apply_performance_plan(kept, bx::performance_plan());
-  check(performed_apps.audio_capture_mode == "desktop" && performed_apps.audio_apps.empty() &&
-            bx::plan_audio_routing(performed_apps).desktop_captured,
-        "Performance mode records desktop + microphone and ignores saved app slots");
-  check(kept.audio_capture_mode == "desktop" && kept.audio_apps.size() == 2,
+  const bx::Config performed_outputs = bx::apply_performance_plan(kept, bx::performance_plan());
+  check(performed_outputs.audio_capture_mode == "desktop" && performed_outputs.audio_outputs.empty() &&
+            bx::plan_audio_routing(performed_outputs).desktop_captured,
+        "Performance mode records desktop + microphone and ignores saved output slots");
+  check(kept.audio_capture_mode == "desktop" && kept.audio_outputs.size() == 2,
         "Performance mode does not rewrite the stored audio mode or slots");
 
   // The sidecar contract: 1-based tracks, roles and titles, written only for a multitrack file.
-  const bx::Json sidecar = bx::audio_track_metadata(game_plan);
+  const bx::Json sidecar = bx::audio_track_metadata(plan);
   check(sidecar["version"].as_int(0) == 2 && sidecar["tracks"].items().size() == 4,
         "the sidecar names every track");
   check(sidecar["tracks"].items()[0]["index"].as_int(0) == 1 &&
             sidecar["tracks"].items()[0]["role"].as_string() == "mix" &&
-            sidecar["tracks"].items()[3]["index"].as_int(0) == 4,
-        "the sidecar counts tracks from 1 like the mixer");
+            sidecar["tracks"].items()[3]["index"].as_int(0) == 4 &&
+            sidecar["tracks"].items()[2]["role"].as_string() == "output",
+        "the sidecar counts tracks from 1 like the mixer and labels an output");
   const std::string root = temp_directory() + "\\audio";
   CreateDirectoryA(root.c_str(), nullptr);
   const std::string clip = root + "\\multitrack.mp4";
   bx::write_file_atomic(clip, "recorded bytes");
-  check(bx::write_audio_sidecar(clip, game_plan), "a multitrack clip gets its sidecar");
+  check(bx::write_audio_sidecar(clip, plan), "a multitrack clip gets its sidecar");
   const bx::AudioLayout round_trip = bx::read_audio_layout(clip, 4);
-  check(round_trip.buffrx && round_trip.tracks[3].title == "BuffrX Game" &&
-            round_trip.tracks[3].sources.size() == 1 && round_trip.tracks[3].sources[0] == "app:game",
-        "the game track reads back generically, with no stale executable in it");
+  check(round_trip.buffrx && round_trip.tracks[2].title == "BuffrX Headphones" &&
+            round_trip.tracks[2].sources.size() == 1 && round_trip.tracks[2].sources[0] == "output:speakers-endpoint",
+        "the output track reads back with the endpoint it recorded");
   check(GetFileAttributesA((clip + bx::kAudioSidecarSuffix).c_str()) != INVALID_FILE_ATTRIBUTES,
         "the sidecar sits beside the media file");
   check(bx::write_audio_sidecar(root + "\\single.mp4", bx::plan_audio_routing(bx::Config{})) &&
@@ -1246,183 +1141,56 @@ void test_audio_routing() {
         "a single-track clip writes no sidecar, so an old file is never mistaken for a BuffrX mix");
 }
 
-// What the page and the one card say about the selected slots (audio_health.h): a program that is simply
-// closed is quiet, a captured game with no slot is said once, and recovery earns a new notice.
+// What the one card says about automatic capture (audio_health.h): every lane silent while recording is
+// said once, a quiet desktop says nothing, and recovery earns a new notice.
 void test_audio_health() {
   std::printf("audio health\n");
   bx::AudioHealthFacts facts;
-  facts.apps_mode = true;
   facts.capture_active = true;
   bx::AudioHealthSlot discord;
   discord.exe = "Discord.exe";
-  bx::AudioHealthSlot game_slot;
-  game_slot.game = true;
   facts.slots = {discord};
 
   check(bx::audio_health_problem(facts) == bx::AudioProblem::all_unavailable,
-        "every selected slot silent while recording is a problem");
+        "every lane silent while recording is a problem");
   facts.slots[0].connected = true;
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "a connected slot is quiet");
+  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "a connected lane is quiet");
   facts.capture_active = false;
   facts.slots[0].connected = false;
   check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "nothing is said while the buffer is off");
   facts.capture_active = true;
 
-  facts.captured_game_exe = "cs2.exe";
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::game_missing,
-        "a captured game that is not one of the selected apps is the more important problem");
-  const bx::AudioHealthFacts missing = facts;
-  facts.slots.push_back(bx::AudioHealthSlot{false, "cs2.exe", false});
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::game_waiting,
-        "the game's program selected but not connected is 'not connected', not 'not selected'");
-  facts.slots = missing.slots;
-  facts.slots.push_back(game_slot);
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::game_waiting,
-        "a Current game slot waiting for its game is its own problem");
-  facts.slots[1].connected = true;
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "a connected game slot covers the game");
-  facts.slots = missing.slots;
-  facts.slots[0].connected = true;
-  facts.captured_game_exe = "Discord.exe";
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::none,
-        "the captured game being one of the selected programs needs no card");
+  check(bx::audio_health_problem(bx::AudioHealthFacts{}) == bx::AudioProblem::none,
+        "an empty automatic plan says nothing");
 
-  // Connected is what covers a game: a selected game program that never hooked is a problem even when
-  // another app is recording, because hooked state is the only evidence that its sound is being captured.
-  bx::AudioHealthFacts named_waiting;
-  named_waiting.apps_mode = true;
-  named_waiting.capture_active = true;
-  named_waiting.captured_game_exe = "cs2.exe";
-  named_waiting.slots = {bx::AudioHealthSlot{false, "Discord.exe", true},
-                         bx::AudioHealthSlot{false, "cs2.exe", false}};
-  check(bx::audio_health_problem(named_waiting) == bx::AudioProblem::game_waiting,
-        "a selected game whose audio never connected warns although another app is connected");
-  named_waiting.slots[1].connected = true;
-  check(bx::audio_health_problem(named_waiting) == bx::AudioProblem::none,
-        "the same game once connected is quiet");
-  // A Current game slot covered by a connected named route: its own lane waits but nothing is missing.
-  bx::AudioHealthFacts covered;
-  covered.apps_mode = true;
-  covered.capture_active = true;
-  covered.captured_game_exe = "cs2.exe";
-  covered.slots = {bx::AudioHealthSlot{false, "Discord.exe", true},
-                   bx::AudioHealthSlot{true, "cs2.exe", false},
-                   bx::AudioHealthSlot{false, "cs2.exe", true}};
-  check(bx::audio_health_problem(covered) == bx::AudioProblem::none,
-        "a game covered by a named slot is not a second warning");
-  covered.slots[2].connected = false;
-  covered.slots[0].connected = false;
-  check(bx::audio_health_problem(covered) == bx::AudioProblem::game_waiting,
-        "a covered game that has no connected route at all still warns");
-
-  // New selections start empty: a game that plays while nothing is selected records no game audio either, so the
-  // one card and the standing line still say so. It stops the moment something records, the game stops, or another
-  // mode (or Performance mode's override) is what records.
-  bx::AudioHealthFacts empty_selection;
-  empty_selection.apps_mode = true;
-  empty_selection.capture_active = true;
-  empty_selection.captured_game_exe = "cs2.exe";
-  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::game_missing,
-        "an empty selection while a game plays is missing game audio");
-  check(bx::audio_health_key(empty_selection, bx::AudioProblem::game_missing) ==
-            bx::audio_health_key(missing, bx::AudioProblem::game_missing),
-        "the empty selection is the same once-per-game problem, not a second warning");
-  empty_selection.capture_active = false;
-  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
-        "nothing records, so an empty selection says nothing");
-  empty_selection.capture_active = true;
-  empty_selection.captured_game_exe.clear();
-  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
-        "no game and no selection is quiet");
-  empty_selection.captured_game_exe = "cs2.exe";
-  empty_selection.apps_mode = false;
-  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
-        "desktop audio and Performance mode's override are not app-selection problems");
-  empty_selection.apps_mode = true;
-  empty_selection.slots = {bx::AudioHealthSlot{false, "cs2.exe", true}};
-  check(bx::audio_health_problem(empty_selection) == bx::AudioProblem::none,
-        "selecting the game's own program recovers the empty-selection warning");
-
-  // Which game a card may name: the one the picture holds, from the detectors' evidence. A display capture shows
-  // whatever is on that screen, a window capture only its own program, and a game capture only its game. The
-  // warning target is not the Current game routing target, so a display capture with nothing routed still warns.
-  bx::AudioCoverage coverage;
-  coverage.capture_mode = "display";
-  coverage.detected_game_exe = "cs2.exe";
-  check(bx::audio_warning_game(coverage) == "cs2.exe",
-        "a display capture names the game the detectors see, with no game-captured target at all");
-  coverage.captured_game_exe = "fortnite.exe";
-  check(bx::audio_warning_game(coverage) == "cs2.exe",
-        "the routing target of another game is not what a display capture is told about");
-  coverage.detected_game_exe.clear();
-  check(bx::audio_warning_game(coverage).empty(), "no game known and no game detected names nothing");
-  coverage.capture_mode = "window";
-  coverage.detected_game_exe = "cs2.exe";
-  coverage.window_exe = "Discord.exe";
-  check(bx::audio_warning_game(coverage).empty(),
-        "a window capture of another program does not cover the game, so it says nothing about it");
-  coverage.window_exe.clear();
-  check(bx::audio_warning_game(coverage).empty(), "a window capture whose program is unknown names nothing");
-  coverage.window_exe = "CS2.exe";
-  check(bx::audio_warning_game(coverage) == "cs2.exe",
-        "a window capture of the game itself covers it, whatever the case of the name");
-  coverage.capture_mode = "game";
-  coverage.captured_game_exe.clear();
-  check(bx::audio_warning_game(coverage).empty(),
-        "a game capture with no game running names nothing, even when a detector sees one");
-  coverage.captured_game_exe = "fortnite.exe";
-  check(bx::audio_warning_game(coverage) == "fortnite.exe", "a game capture names the game it is on");
-  coverage.capture_mode = "display";
-  check(bx::audio_warning_game(coverage) == "cs2.exe",
-        "leaving the game capture hands the display its own detector's game");
-
-  // The two halves joined: an empty selection, a buffer, and the game a display capture holds is the same once-
-  // per-game problem the captured-game path raises.
-  bx::AudioHealthFacts covered_game;
-  covered_game.apps_mode = true;
-  covered_game.capture_active = true;
-  bx::AudioCoverage display;
-  display.capture_mode = "display";
-  display.detected_game_exe = "cs2.exe";
-  covered_game.captured_game_exe = bx::audio_warning_game(display);
-  check(bx::audio_health_problem(covered_game) == bx::AudioProblem::game_missing,
-        "a display capture over an unselected game warns exactly as a game capture does");
-  check(bx::audio_health_key(covered_game, bx::AudioProblem::game_missing) ==
-            bx::audio_health_key(missing, bx::AudioProblem::game_missing),
-        "and it is the same problem key, so switching modes is not a second card");
-
-  facts.apps_mode = false;
-  check(bx::audio_health_problem(facts) == bx::AudioProblem::none, "desktop mode has no slot problem");
-
-  // What status.audio publishes: the same policy under a wire name, and a steady gate so a game that is still
-  // starting or a route that is still connecting never flashes a line under the slots.
-  check(std::string(bx::audio_problem_name(bx::AudioProblem::game_missing)) == "game_missing" &&
-            std::string(bx::audio_problem_name(bx::AudioProblem::game_waiting)) == "game_waiting" &&
-            std::string(bx::audio_problem_name(bx::AudioProblem::all_unavailable)) == "all_unavailable" &&
+  // What status.audio publishes: the same policy under a wire name, and a steady gate so a capture that is
+  // still starting never flashes a line under the lanes.
+  check(std::string(bx::audio_problem_name(bx::AudioProblem::all_unavailable)) == "all_unavailable" &&
             std::string(bx::audio_problem_name(bx::AudioProblem::none)).empty(),
         "each audio problem has its wire name, and none has none");
-  check(!bx::audio_problem_steady(bx::AudioProblem::game_missing, 1499) &&
-            bx::audio_problem_steady(bx::AudioProblem::game_missing, 1500) &&
+  check(!bx::audio_problem_steady(bx::AudioProblem::all_unavailable, 1499) &&
+            bx::audio_problem_steady(bx::AudioProblem::all_unavailable, 1500) &&
             !bx::audio_problem_steady(bx::AudioProblem::none, 60000),
         "the persistent line waits out a start and never draws when nothing is wrong");
 
-  // One card per unresolved problem: after the grace, once; recovery forgets it; another game is new.
+  // One card per unresolved problem: after the grace, once; recovery forgets it; a different set of lanes
+  // is new.
   bx::AudioNoticeState state;
-  const std::string key = bx::audio_health_key(missing, bx::AudioProblem::game_missing);
-  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 1000, 10000), "no card inside the grace");
-  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 9000, 10000), "still inside the grace");
-  check(bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 11000, 10000), "the card comes once after it");
-  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 60000, 10000), "and never repeats");
+  const std::string key = bx::audio_health_key(facts, bx::AudioProblem::all_unavailable);
+  check(!bx::audio_notice_due(state, bx::AudioProblem::all_unavailable, key, 1000, 10000), "no card inside the grace");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::all_unavailable, key, 9000, 10000), "still inside the grace");
+  check(bx::audio_notice_due(state, bx::AudioProblem::all_unavailable, key, 11000, 10000), "the card comes once after it");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::all_unavailable, key, 60000, 10000), "and never repeats");
   check(!bx::audio_notice_due(state, bx::AudioProblem::none, std::string(), 61000, 10000), "recovery clears it");
-  check(!bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 62000, 10000), "a new occurrence waits again");
-  check(bx::audio_notice_due(state, bx::AudioProblem::game_missing, key, 73000, 10000), "then it is told once more");
-  bx::AudioHealthFacts other_game = missing;
-  other_game.captured_game_exe = "fortnite.exe";
-  check(bx::audio_notice_due(state, bx::AudioProblem::game_missing,
-                             bx::audio_health_key(other_game, bx::AudioProblem::game_missing), 74000, 10000) == false,
-        "another game restarts the grace, it is not a repeat of the old problem");
+  check(!bx::audio_notice_due(state, bx::AudioProblem::all_unavailable, key, 62000, 10000), "a new occurrence waits again");
+  check(bx::audio_notice_due(state, bx::AudioProblem::all_unavailable, key, 73000, 10000), "then it is told once more");
+  bx::AudioHealthFacts other_lanes;
+  other_lanes.capture_active = true;
+  other_lanes.slots = {bx::AudioHealthSlot{"firefox.exe", false}};
+  check(bx::audio_notice_due(state, bx::AudioProblem::all_unavailable,
+                             bx::audio_health_key(other_lanes, bx::AudioProblem::all_unavailable), 74000, 10000) == false,
+        "another set of lanes restarts the grace, it is not a repeat of the old problem");
 }
-
 
 // A file's own audio layout (audio_layout.h): which tracks it has, whether track 1 is an aggregate mix,
 // and whether that mix can be rebuilt from the tracks after it - the decision the preview and the export

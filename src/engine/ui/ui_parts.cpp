@@ -133,30 +133,23 @@ void audio_speaker_icon(const Json& sessions, const std::string& exe, ImVec2 at,
   draw_icon(draw, icon, at, size, color, 1.4f);
 }
 
-// How a selected slot really is (status.audio.slots): "Recording now" only when win-wasapi is hooked and a
-// capture is running, "Waiting" for a program that is not running, and "Could not capture" only for a real
-// failure. A connected source while the buffer is stopped is ready, not recording.
-std::string audio_slot_hint(const Json& status, size_t index, bool game, const std::string& name) {
+// How a selected output really is (status.audio.outputs): "Recording now" only when its loopback source
+// exists and a capture is running, "Waiting" while the source has not been made, and "Could not capture"
+// only for a real failure.
+std::string audio_output_hint(const Json& status, size_t index, const std::string& name) {
   const Json& audio = status["audio"];
   if (!audio["recorded"].as_bool(true)) {
     return status["performance"]["active"].as_bool() ? "Not recorded while Performance mode runs"
-                                                     : "Saved; not recorded while Desktop audio is chosen";
+                                                     : "Saved; not recorded while another audio mode is chosen";
   }
   Json slot = Json::object();
-  const std::vector<Json>& slots = audio["slots"].items();
+  const std::vector<Json>& slots = audio["outputs"].items();
   if (index < slots.size()) slot = slots[index];
   const std::string state = slot["state"].as_string("waiting");
   const bool recording = status["buffering"].as_bool() || status["recording"].as_bool();
-  if (state == "covered") {
-    if (!recording) return "Ready with the selected app when recording starts";
-    const std::string exe = slot["exe"].as_string();
-    return exe.empty() ? "Recorded with a selected app (one capture)"
-                       : "Recorded with " + program_name(exe) + " (one capture)";
-  }
   if (state == "connected") return recording ? "Recording now" : "Ready when recording starts";
-  if (state == "failed") return "Could not capture this app's audio";
-  if (game) return slot["exe"].as_string().empty() ? "No game captured yet" : "Connecting to the game";
-  return "Waiting for " + name + " to start";
+  if (state == "failed") return "Could not capture this output";
+  return "Waiting for " + name;
 }
 
 // ---------------------------------------------------------------- actions

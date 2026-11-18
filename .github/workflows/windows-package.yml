@@ -1,0 +1,43 @@
+name: Windows portable package
+
+# Manual-only: builds the Windows portable folder from this branch and uploads one zip.
+# Used when a Windows binary is needed but the change was made on another platform.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - shell: powershell
+        run: |
+          ./tools/bootstrap-toolchain.ps1
+          ./tools/bootstrap-rust.ps1
+          ./tools/prepare-runtime.ps1
+          ./tools/prepare-headers.ps1
+      - run: npm ci --prefix ui
+      - shell: powershell
+        run: |
+          npm --prefix ui run build
+          ./tools/build.ps1
+          ./tools/package.ps1 -Version 0.6.1
+          Compress-Archive -Path dist/BuffrX-0.6.1/* -DestinationPath dist/BuffrX-0.6.1-windows-x64.zip -CompressionLevel Optimal
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: buffrx-windows-portable
+          path: dist/BuffrX-0.6.1-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7

@@ -79,9 +79,9 @@ namespace {
 // clip came out with a silent AAC track. Channel 0 is the capture scene.
 constexpr uint32_t kDesktopViewChannel = 1;
 constexpr uint32_t kMicViewChannel = 2;
-// Application captures sit above the two fixed channels. Five tracks can carry apps (2..6) and up to
-// eight routes may share them; libobs has 64 channels and only these are cleared and set here.
-constexpr uint32_t kAppAudioViewChannelBase = 16;
+// Per-output loopbacks sit above the two fixed channels. Four outputs at most; libobs has 64 channels
+// and only these are cleared and set here.
+constexpr uint32_t kOutputAudioViewChannelBase = 16;
 // Automatic mode's four buses (tracks 3..6). Kept clear of the manual slots so the two plans can never
 // share a channel, and small enough that no other view channel is touched.
 constexpr uint32_t kAutoAudioViewChannelBase = 24;
@@ -1068,7 +1068,7 @@ void ObsHost::release_idle_sources() {
   detach_meter(&mic_volmeter_);
   obs_set_output_source(kDesktopViewChannel, nullptr);
   obs_set_output_source(kMicViewChannel, nullptr);
-  release_app_audio();
+  release_output_audio();
   release_auto_audio();
   if (desktop_) {
     obs_source_release(desktop_);
@@ -1106,7 +1106,7 @@ bool ObsHost::enter_deep_idle() {
   RebuildGuard rebuilding(rebuild_gate_);
   // Re-checked here, under the lock: the tick asked a moment ago, and a start may have come in since.
   if (buffer_intent_ || recording_active_ || manual_active_ || recording_pending_ ||
-      !sources_released_ || capture_item_ || desktop_ || mic_ || !app_channels_.empty() || !auto_channels_.empty()) return false;
+      !sources_released_ || capture_item_ || desktop_ || mic_ || !output_channels_.empty() || !auto_channels_.empty()) return false;
   const uint32_t started = GetTickCount();
   // The outputs and encoders hold the video handler that the reset frees, so they go first, as in a video change.
   // The encoder's settings stay as a snapshot of what last ran; the Video page derives the next settings from the config.
@@ -1332,8 +1332,18 @@ void ObsHost::detach_meter(obs_volmeter** meter) {
   } else if (meter == &mic_volmeter_) {
     mic_level_db_.store(kAudioMeterSilenceDb, std::memory_order_relaxed);
     level_mic_.store(0.0f, std::memory_order_relaxed);
+  } else {
+    // A per-output meter: its channel's own peak goes silent with it.
+    for (size_t i = 0; i < output_channels_.size(); ++i) {
+      if (&output_channels_[i]->meter != meter) continue;
+      output_channels_[i]->level_db.store(kAudioMeterSilenceDb, std::memory_order_relaxed);
+      if (i < level_outputs_.size()) level_outputs_[i].store(0.0f, std::memory_order_relaxed);
+      break;
+    }
   }
-  audio_meters_active_.store(desktop_volmeter_ || mic_volmeter_, std::memory_order_relaxed);
+  bool any = desktop_volmeter_ || mic_volmeter_;
+  for (const std::unique_ptr<OutputAudioChannel>& channel : output_channels_) any = any || channel->meter;
+  audio_meters_active_.store(any, std::memory_order_relaxed);
 }
 
 void ObsHost::set_audio_metering(bool enabled) {
@@ -1342,9 +1352,13 @@ void ObsHost::set_audio_metering(bool enabled) {
   if (enabled) {
     if (desktop_) attach_meter(desktop_, &desktop_volmeter_, &desktop_level_db_);
     if (mic_) attach_meter(mic_, &mic_volmeter_, &mic_level_db_);
+    for (const std::unique_ptr<OutputAudioChannel>& channel : output_channels_) {
+      if (channel->source) attach_meter(channel->source, &channel->meter, &channel->level_db);
+    }
   } else {
     detach_meter(&desktop_volmeter_);
     detach_meter(&mic_volmeter_);
+    for (const std::unique_ptr<OutputAudioChannel>& channel : output_channels_) detach_meter(&channel->meter);
   }
 }
 
@@ -1352,6 +1366,10 @@ void ObsHost::sample_audio_levels(bool sample_mic) {
   level_desktop_.store(audio_meter_level(audio_meter_take_peak(desktop_level_db_)), std::memory_order_relaxed);
   if (sample_mic)
     level_mic_.store(microphone_meter_level(audio_meter_take_peak(mic_level_db_)), std::memory_order_relaxed);
+  for (size_t i = 0; i < output_channels_.size() && i < level_outputs_.size(); ++i) {
+    level_outputs_[i].store(audio_meter_level(audio_meter_take_peak(output_channels_[i]->level_db)),
+                            std::memory_order_relaxed);
+  }
 }
 
 // Live updates for one audio channel. Releasing an audio source under the audio-io thread is the
@@ -1439,17 +1457,17 @@ bool ObsHost::configure_audio(const Config& config) {
                          config.mic_device.empty() ? "default" : config.mic_device.c_str(),
                          static_cast<float>(config.mic_volume * mic_gain), config.mic_muted, plan.mic_mixers,
                          config.mic_enabled, kMicViewChannel);
-    // Any manual application slots are released: the two plans must never share a channel.
-    configure_app_audio(AudioRoutingPlan{});
+    // Any manual captures are released: the two plans must never share a channel.
+    configure_output_audio(AudioRoutingPlan{});
     configure_auto_audio(auto_sessions_, GetTickCount64());
     apply_mic_filters(config);
     return desktop_ != nullptr || mic_ != nullptr || !auto_channels_.empty();
   }
-  // One plan owns the mixer bits, so the device loopback, the microphone and every application source
-  // cannot disagree about their tracks. While an application slot exists the desktop loopback is off:
-  // Windows cannot capture the desktop without an app that is also captured on its own track.
+  // One plan owns the mixer bits, so the device loopback, the microphone and every output loopback cannot
+  // disagree about their tracks. The all-sound-together mode uses the desktop loopback; the outputs mode
+  // turns it off because each selected output has its own capture.
   release_auto_audio();
-  const AudioRoutingPlan plan = plan_audio_routing(config, game_target_);
+  const AudioRoutingPlan plan = plan_audio_routing(config);
   const double mic_gain = std::pow(10.0, config.mic_gain_db / 20.0);
   update_audio_channel(desktop_, &desktop_volmeter_, &desktop_level_db_, desktop_device_, kDesktopCaptureSource,
                        "Desktop audio", config.desktop_device.empty() ? "default" : config.desktop_device.c_str(),
@@ -1459,306 +1477,84 @@ bool ObsHost::configure_audio(const Config& config) {
                        config.mic_device.empty() ? "default" : config.mic_device.c_str(),
                        static_cast<float>(config.mic_volume * mic_gain), config.mic_muted, plan.mic_mixers,
                        config.mic_enabled, kMicViewChannel);
-  configure_app_audio(plan);
+  configure_output_audio(plan);
   apply_mic_filters(config);
-  return desktop_ != nullptr || mic_ != nullptr || !app_channels_.empty();
+  return desktop_ != nullptr || mic_ != nullptr || !output_channels_.empty();
 }
 
-void ObsHost::configure_app_audio(const AudioRoutingPlan& plan) {
-  // The plan and the channels are index-aligned. A slot whose key and window are unchanged keeps its
-  // source: a device switch, a microphone filter or another app's edit must never tear down a healthy
-  // capture (and its hook). A slot that is gone has its channel released; a game slot with no game keeps
-  // its place with no source, so the selected track stays silently empty instead of recording the desktop.
-  while (app_channels_.size() < plan.apps.size()) app_channels_.push_back(std::make_unique<AppAudioChannel>());
-  for (size_t i = plan.apps.size(); i < app_channels_.size(); ++i) {
-    obs_set_output_source(kAppAudioViewChannelBase + static_cast<uint32_t>(i), nullptr);
-    release_app_channel(*app_channels_[i]);
+void ObsHost::configure_output_audio(const AudioRoutingPlan& plan) {
+  // The plan and the channels are index-aligned. A slot whose device is unchanged keeps its source: a
+  // microphone filter or another output's edit must never tear down a healthy loopback. A slot that is
+  // gone has its channel released, and its canvas channel cleared.
+  while (output_channels_.size() < plan.outputs.size()) output_channels_.push_back(std::make_unique<OutputAudioChannel>());
+  for (size_t i = plan.outputs.size(); i < output_channels_.size(); ++i) {
+    obs_set_output_source(kOutputAudioViewChannelBase + static_cast<uint32_t>(i), nullptr);
+    release_output_channel(*output_channels_[i]);
   }
-  if (app_channels_.size() > plan.apps.size()) app_channels_.resize(plan.apps.size());
-  for (size_t i = 0; i < plan.apps.size(); ++i) {
-    AppAudioChannel& channel = *app_channels_[i];
-    const AudioApp& app = plan.apps[i];
-    const uint32_t view_channel = kAppAudioViewChannelBase + static_cast<uint32_t>(i);
-    const std::string key = audio_app_key(app);
-    if (app.exe.empty() || app.window.empty()) {
-      if (channel.source) {
-        obs_set_output_source(view_channel, nullptr);
-        release_app_channel(channel);
-      }
-      channel.key = key;
-      channel.game = audio_app_is_game(app);
-      channel.covered = false;
-      channel.window.clear();
-      channel.exe.clear();
-      if (channel.game) {
-        // A game the person selected by name already records this program: the lane stays (and is
-        // labelled Game) but it makes no second capture. Otherwise the lane waits silently for a game.
-        channel.covered = plan.game_covered_slot >= 0;
-        if (channel.covered) channel.exe = game_target_.exe;
-        if (!channel.said_missing) {
-          BX_LOG_INFO(channel.covered ? "current game audio is covered by a selected app"
-                                      : "current game audio waits: no game is being captured yet");
-          channel.said_missing = true;
-        }
-      }
+  if (output_channels_.size() > plan.outputs.size()) output_channels_.resize(plan.outputs.size());
+  for (size_t i = 0; i < plan.outputs.size(); ++i) {
+    OutputAudioChannel& channel = *output_channels_[i];
+    const AudioOutput& output = plan.outputs[i];
+    const std::string device = audio_output_key(output);
+    const uint32_t view_channel = kOutputAudioViewChannelBase + static_cast<uint32_t>(i);
+    const std::string source_name = "BuffrX output " + std::to_string(i + 1);
+    const bool ok = update_audio_channel(channel.source, &channel.meter, &channel.level_db, channel.device,
+                                        kDesktopCaptureSource, source_name.c_str(), device.c_str(),
+                                        static_cast<float>(audio_output_volume(output.volume)), output.muted,
+                                        plan.output_mixers[i], true, view_channel);
+    channel.failed = !ok;
+    if (!ok) {
+      BX_LOG_WARN("output audio %s could not be created; its track stays empty", device.c_str());
       continue;
     }
-    if (channel.source && channel.key == key) {
-      // The same program: a retitled window is bound in place; any other window id is followed by
-      // win-wasapi's own reconnect thread, so nothing is destroyed here.
-      if (channel.window != app.window) {
-        obs_data_t* settings = obs_data_create();
-        obs_data_set_string(settings, "window", app.window.c_str());
-        obs_data_set_int(settings, "priority", 2);  // WINDOW_PRIORITY_EXE
-        obs_source_update(channel.source, settings);
-        obs_data_release(settings);
-        channel.window = app.window;
-      }
-      channel.exe = app.exe;
-      channel.game = audio_app_is_game(app);
-      channel.covered = false;
-      // A gain or mute change applies to the source that is already capturing: the same channel keeps the
-      // same program (and its hook), so the ring and a running recording continue untouched.
-      obs_source_set_volume(channel.source, static_cast<float>(audio_app_volume(app.volume)));
-      obs_source_set_muted(channel.source, app.muted);
-      obs_source_set_audio_mixers(channel.source, plan.app_mixers[i]);
-      continue;
-    }
-    if (channel.source) {
-      obs_set_output_source(view_channel, nullptr);
-      release_app_channel(channel);
-    }
-    channel.game = audio_app_is_game(app);
-    if (create_app_channel(channel, app, plan.app_mixers[i], view_channel)) {
-      BX_LOG_INFO("application audio %s on track %d", app.exe.c_str(), app.track);
-    }
+    BX_LOG_INFO("output %s on track %d", audio_output_name(output, i).c_str(), kAudioOutputFirstTrack + static_cast<int>(i));
   }
-  audio_app_check_at_ = GetTickCount();
-  audio_health_poll_at_ = audio_app_check_at_;
+  output_audio_check_at_ = GetTickCount();
 }
 
-bool ObsHost::create_app_channel(AppAudioChannel& channel, const AudioApp& app, uint32_t mixers,
-                                 uint32_t view_channel) {
-  channel.key = audio_app_key(app);
-  channel.game = audio_app_is_game(app);
-  channel.window = app.window;
-  channel.exe = app.exe;
-  channel.failed = false;
-  channel.connected.store(false);
-  {
-    std::lock_guard<std::mutex> lock(channel.health_mutex);
-    channel.hooked_exe.clear();
-    channel.hooked_title.clear();
-  }
-  obs_data_t* settings = obs_data_create();
-  obs_data_set_string(settings, "window", app.window.c_str());
-  // Match by executable after the title: a Discord window retitles itself, an executable does not.
-  // 2 is WINDOW_PRIORITY_EXE in win-wasapi.
-  obs_data_set_int(settings, "priority", 2);
-  const std::string name = channel.game ? std::string("BuffrX game audio") : "BuffrX app " + app.exe;
-  obs_source_t* source =
-      obs_source_create("wasapi_process_output_capture", name.c_str(), settings, nullptr);
-  obs_data_release(settings);
-  if (!source) {
-    // The capture source itself could not be made (Windows older than 1703, or no process-loopback
-    // support). This is the one state that is a failure, and the page says so.
-    channel.failed = true;
-    if (!channel.said_missing) {
-      BX_LOG_WARN("application audio %s could not be created; its track stays empty", app.exe.c_str());
-      channel.said_missing = true;
-    }
-    return false;
-  }
-  channel.source = source;
-  channel.said_missing = false;
-  // The hook state, before a transition could be missed between the source starting and this connection.
-  signal_handler_t* handler = obs_source_get_signal_handler(source);
-  signal_handler_connect(handler, "hooked", &ObsHost::on_app_hooked, &channel);
-  signal_handler_connect(handler, "unhooked", &ObsHost::on_app_unhooked, &channel);
-  obs_source_set_volume(source, static_cast<float>(audio_app_volume(app.volume)));
-  obs_source_set_muted(source, app.muted);
-  obs_source_set_audio_mixers(source, mixers);
-  // Last, as with every audio source: the canvas channel is what makes the mixer read it.
-  obs_set_output_source(view_channel, source);
-  return true;
+void ObsHost::poll_output_audio() {
+  // A source that could not be made (a device driver still starting, a card returning) is retried slowly.
+  // A working loopback is never recreated here: a fader or another device's change updates it in place.
+  bool failed = false;
+  for (const std::unique_ptr<OutputAudioChannel>& channel : output_channels_) failed = failed || channel->failed;
+  if (!failed) return;
+  const uint32_t now = GetTickCount();
+  if (output_audio_check_at_ != 0 && now - output_audio_check_at_ < kOutputAudioCheckMs) return;
+  configure_output_audio(plan_audio_routing(effective_config()));
 }
 
-void ObsHost::release_app_channel(AppAudioChannel& channel) {
+void ObsHost::release_output_channel(OutputAudioChannel& channel) {
+  detach_meter(&channel.meter);
   if (channel.source) {
-    // The callbacks point at this channel: they must be gone before the source that could call them.
-    signal_handler_t* handler = obs_source_get_signal_handler(channel.source);
-    signal_handler_disconnect(handler, "hooked", &ObsHost::on_app_hooked, &channel);
-    signal_handler_disconnect(handler, "unhooked", &ObsHost::on_app_unhooked, &channel);
     obs_source_release(channel.source);
     channel.source = nullptr;
   }
+  channel.device.clear();
   channel.failed = false;
-  channel.connected.store(false);
-  channel.window.clear();
-  channel.exe.clear();
-  std::lock_guard<std::mutex> lock(channel.health_mutex);
-  channel.hooked_exe.clear();
-  channel.hooked_title.clear();
+  channel.level_db.store(kAudioMeterSilenceDb, std::memory_order_relaxed);
 }
 
-void ObsHost::on_app_hooked(void* data, calldata_t* call) {
-  auto* channel = static_cast<AppAudioChannel*>(data);
-  if (!channel) return;
-  const char* exe = calldata_string(call, "executable");
-  const char* title = calldata_string(call, "title");
-  {
-    std::lock_guard<std::mutex> lock(channel->health_mutex);
-    channel->hooked_exe = exe ? exe : "";
-    channel->hooked_title = title ? title : "";
-  }
-  channel->connected.store(true);  // after the strings, so a reader never sees connected with no name
-}
-
-void ObsHost::on_app_unhooked(void* data, calldata_t* call) {
-  (void)call;
-  auto* channel = static_cast<AppAudioChannel*>(data);
-  if (!channel) return;
-  channel->connected.store(false);
-}
-
-void ObsHost::poll_audio_health() {
-  // win-wasapi owns reconnection: its own thread retries every two seconds and follows a retitled window,
-  // a restarted program, a new process id and a minimized window, all by the executable it was given. The
-  // engine's job is only what the plugin cannot say for itself: the hook state for the page (get_hooked,
-  // twice a second at most) and a source that could not be created at all (retried slowly). No window or
-  // session list is enumerated here, and nothing is sampled.
-  if (app_channels_.empty()) return;
-  const uint32_t now = GetTickCount();
-  const bool poll = audio_health_poll_at_ == 0 || now - audio_health_poll_at_ >= kAudioHealthPollMs;
-  if (poll) audio_health_poll_at_ = now;
-  bool missing = false;
-  for (const std::unique_ptr<AppAudioChannel>& ptr : app_channels_) {
-    AppAudioChannel& channel = *ptr;
-    if (!channel.source) {
-      // A waiting game slot has no window to make a source for; it is not missing.
-      missing = missing || !channel.window.empty();
-      continue;
-    }
-    if (!poll) continue;
-    proc_handler_t* proc = obs_source_get_proc_handler(channel.source);
-    if (!proc) continue;
-    calldata_t* call = calldata_create();
-    proc_handler_call(proc, "get_hooked", call);
-    const bool hooked = calldata_bool(call, "hooked");
-    if (hooked) {
-      const char* exe = calldata_string(call, "executable");
-      const char* title = calldata_string(call, "title");
-      std::lock_guard<std::mutex> lock(channel.health_mutex);
-      channel.hooked_exe = exe ? exe : "";
-      channel.hooked_title = title ? title : "";
-    }
-    channel.connected.store(hooked);
-    calldata_free(call);
-  }
-  if (!missing) return;
-  if (audio_app_check_at_ != 0 && now - audio_app_check_at_ < kAudioAppCheckMs) return;
-  audio_app_check_at_ = now;
-  configure_app_audio(plan_audio_routing(config_, game_target_));
-}
-
-void ObsHost::set_game_audio_target(const GameAudioTarget& target) {
-  if (target.active == game_target_.active && target.exe == game_target_.exe &&
-      target.window == game_target_.window) {
-    return;
-  }
-  game_target_ = target;
-  update_game_audio_channel();
-}
-
-void ObsHost::update_game_audio_channel() {
-  // The game slot's own channel follows the captured game in place: no encoder, no output and no ring is
-  // touched, so a clip or a Timeline chunk that spans two games is still one file, and the track's labels
-  // stay generic ("Game") because they are decided at recording time.
-  const AudioRoutingPlan plan = plan_audio_routing(config_, game_target_);
-  if (plan.game_slot < 0 || static_cast<size_t>(plan.game_slot) >= app_channels_.size()) return;
-  const size_t slot = static_cast<size_t>(plan.game_slot);
-  AppAudioChannel& channel = *app_channels_[slot];
-  const AudioApp& app = plan.apps[slot];
-  const uint32_t view_channel = kAppAudioViewChannelBase + static_cast<uint32_t>(slot);
-  if (plan.game_covered_slot >= 0) {
-    // A named slot already records this program: the game lane keeps its reserved track and its generic
-    // label but makes no second capture, so the same sound cannot be heard twice.
-    if (channel.source) {
-      obs_set_output_source(view_channel, nullptr);
-      release_app_channel(channel);
-    }
-    channel.key = audio_app_key(app);
-    channel.game = true;
-    channel.covered = true;
-    channel.exe = game_target_.exe;
-    BX_LOG_INFO("current game audio is covered by a selected app; no second capture");
-    return;
-  }
-  channel.covered = false;
-  if (app.exe.empty() || app.window.empty()) {
-    if (channel.source) {
-      obs_set_output_source(view_channel, nullptr);
-      release_app_channel(channel);
-      BX_LOG_INFO("current game audio waits: no game is being captured");
-    }
-    channel.key = audio_app_key(app);
-    channel.game = true;
-    channel.covered = false;
-    channel.window.clear();
-    channel.exe.clear();
-    return;
-  }
-  if (!channel.source) {
-    channel.game = true;
-    if (create_app_channel(channel, app, plan.app_mixers[slot], view_channel)) {
-      BX_LOG_INFO("current game audio follows %s on track %d", app.exe.c_str(), app.track);
-    }
-    return;
-  }
-  if (channel.window != app.window) {
-    obs_data_t* settings = obs_data_create();
-    obs_data_set_string(settings, "window", app.window.c_str());
-    obs_data_set_int(settings, "priority", 2);
-    obs_source_update(channel.source, settings);
-    obs_data_release(settings);
-    channel.window = app.window;
-    channel.exe = app.exe;
-    BX_LOG_INFO("current game audio follows %s", app.exe.c_str());
-  }
-  obs_source_set_volume(channel.source, static_cast<float>(audio_app_volume(app.volume)));
-  obs_source_set_muted(channel.source, app.muted);
-  obs_source_set_audio_mixers(channel.source, plan.app_mixers[slot]);
-}
-
-std::vector<ObsHost::AudioSlotHealth> ObsHost::audio_slot_health() const {
-  std::vector<AudioSlotHealth> out;
-  out.reserve(app_channels_.size());
-  for (size_t i = 0; i < app_channels_.size(); ++i) {
-    const AppAudioChannel& channel = *app_channels_[i];
-    AudioSlotHealth health;
-    health.game = channel.game;
-    health.covered = channel.covered;
-    health.exe = channel.exe;
-    health.track = kAudioAppFirstTrack + static_cast<int>(i);
+std::vector<ObsHost::AudioOutputHealth> ObsHost::audio_output_health() const {
+  std::vector<AudioOutputHealth> out;
+  out.reserve(output_channels_.size());
+  for (size_t i = 0; i < output_channels_.size(); ++i) {
+    const OutputAudioChannel& channel = *output_channels_[i];
+    AudioOutputHealth health;
+    health.device = channel.device;
+    health.track = kAudioOutputFirstTrack + static_cast<int>(i);
     health.allocated = channel.source != nullptr;
-    health.connected = channel.source != nullptr && channel.connected.load();
     health.failed = channel.failed;
-    {
-      std::lock_guard<std::mutex> lock(channel.health_mutex);
-      health.title = channel.connected.load() ? channel.hooked_title : std::string();
-      if (health.title.empty()) health.title.clear();
-    }
     out.push_back(std::move(health));
   }
   return out;
 }
 
-void ObsHost::release_app_audio() {
-  for (size_t i = 0; i < app_channels_.size(); ++i) {
-    obs_set_output_source(kAppAudioViewChannelBase + static_cast<uint32_t>(i), nullptr);
-    release_app_channel(*app_channels_[i]);
+void ObsHost::release_output_audio() {
+  for (size_t i = 0; i < output_channels_.size(); ++i) {
+    obs_set_output_source(kOutputAudioViewChannelBase + static_cast<uint32_t>(i), nullptr);
+    release_output_channel(*output_channels_[i]);
   }
-  app_channels_.clear();
+  output_channels_.clear();
 }
 
 namespace {
@@ -1832,8 +1628,7 @@ void ObsHost::configure_auto_audio(const std::vector<AutoAudioSession>& sessions
   inputs.prefs = config_.audio_app_prefs;
   inputs.now_ms = now_ms;
   inputs.grace_ms = 1500;
-  inputs.game_exe = !auto_game_exe_.empty() ? auto_game_exe_
-                                            : (game_target_.active ? game_target_.exe : std::string());
+  inputs.game_exe = auto_game_exe_;
   inputs.other_volume = config_.audio_other_volume;
   inputs.other_muted = config_.audio_other_muted;
   auto_plan_ = plan_auto_audio(inputs, auto_lane_memory_);
@@ -2404,7 +2199,7 @@ bool ObsHost::configure_encoders(const Config& requested, std::string& error) {
   // Tracks 1..6 as OBS counts them. `separate_tracks` is the older two-source alias: on means three
   // tracks unless the explicit count asks for more. audio_track_count is the spill's own answer too.
   const int track_count = audio_track_count(config);
-  audio_plan_ = plan_audio_routing(config, game_target_);
+  audio_plan_ = plan_audio_routing(config);
   for (int track = 0; track < track_count; ++track) {
     obs_data_t* audio_settings = obs_data_create();
     obs_data_set_int(audio_settings, "bitrate", std::max(64, config.audio_bitrate_kbps));
@@ -5057,11 +4852,11 @@ void ObsHost::tick() {
   check_game_fallback();
   check_display_present();
   update_capture_fit();
-  poll_audio_health();
+  poll_output_audio();
 
   // Idle: the buffer off and no manual record means nobody is watching, so the capture and audio
   // sources go away and the engine stops pulling frames. The next buffer start makes them again.
-  if (!buffer_intent_ && !recording_active_ && !manual_active_ && !recording_pending_ && (capture_item_ || desktop_ || mic_ || !app_channels_.empty() || !sources_released_)) {
+  if (!buffer_intent_ && !recording_active_ && !manual_active_ && !recording_pending_ && (capture_item_ || desktop_ || mic_ || !output_channels_.empty() || !sources_released_)) {
     const uint32_t idle_now = GetTickCount();
     if (idle_since_ms_ == 0) {
       idle_since_ms_ = idle_now;
@@ -5251,6 +5046,8 @@ EngineStats ObsHost::stats() const {
   }
   stats.level_desktop = level_desktop_.load(std::memory_order_relaxed);
   stats.level_mic = level_mic_.load(std::memory_order_relaxed);
+  stats.level_outputs.reserve(output_channels_.size());
+  for (size_t i = 0; i < output_channels_.size(); ++i) stats.level_outputs.push_back(level_output(i));
   stats.audio_meters_active = audio_meters_active();
   return stats;
 }
@@ -5570,7 +5367,7 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
                              audio_track_count(next) != audio_track_count(running) ||
                              next.audio_bitrate_kbps != running.audio_bitrate_kbps ||
                              next.audio_capture_mode != running.audio_capture_mode ||
-                             !audio_apps_equal(effective_audio_apps(next), effective_audio_apps(running));
+                             !audio_outputs_equal(effective_audio_outputs(next), effective_audio_outputs(running));
   const bool audio_sources_changed = config.desktop_device != config_.desktop_device ||
                                      config.mic_device != config_.mic_device ||
                                      config.desktop_enabled != config_.desktop_enabled ||
@@ -5580,10 +5377,10 @@ bool ObsHost::apply(const Config& config, bool restart_outputs, std::string& err
                                      config.audio_app_prefs != config_.audio_app_prefs ||
                                      config.audio_other_volume != config_.audio_other_volume ||
                                      config.audio_other_muted != config_.audio_other_muted ||
-                                     // A fader or a mute on a selected program is a live source change, never
+                                     // A fader or a mute on a selected output is a live source change, never
                                      // a rebuild: the channel keeps its capture and only its volume changes.
-                                     !audio_app_controls_equal(effective_audio_apps(config),
-                                                               effective_audio_apps(config_));
+                                     !audio_output_controls_equal(effective_audio_outputs(config),
+                                                                  effective_audio_outputs(config_));
 
   // A new capture target or canvas costs pictures that are not the encoder's: the controller waits them out.
   if (video_changed || capture_changed) controller_grace(GetTickCount());
@@ -5784,7 +5581,7 @@ void ObsHost::shutdown() {
   // channel is cleared before the source is released or the device stays open past shutdown.
   obs_set_output_source(kDesktopViewChannel, nullptr);
   obs_set_output_source(kMicViewChannel, nullptr);
-  release_app_audio();
+  release_output_audio();
   release_auto_audio();
   if (desktop_) {
     obs_source_release(desktop_);

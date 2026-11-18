@@ -24,20 +24,13 @@ inline constexpr char kDefaultLinkPage[] = "https://buffrx.app/l/";
 // migrated in config_from_json. Not a profile key.
 enum class PerformanceWhen { off, games, always };
 
-// One selected application slot (audio_routing.h). `window` is the win-capture id
-// ("title:class:exe") at the moment it was picked; `exe` is the stable part a restart or a retitled
-// window is matched on. `kind` is empty for a named program and "game" for the Current game slot, whose
-// window and executable follow what BuffrX is capturing. `track` is written for older builds; the plan
-// assigns tracks by slot position (3..6) and never reads it.
-struct AudioApp {
-  std::string window;
-  std::string exe;
-  std::string title;
-  std::string kind;
-  int track = 2;
-  // The program's own live gain, 0..1, and whether its capture is muted. audio.set writes them beside
-  // the route; they change the running source in place and are not part of the routing identity
-  // (audio_routing.h), so a fader never rebuilds the encoders or clears the ring.
+// One selected output on its own track (audio_routing.h). `device` is the capture source's own device
+// id ("default" follows the system default), and `name` is the label it had when it was chosen, so a
+// disconnected device still reads as the one the person picked. The gain and mute change the running
+// source in place and are not part of the routing identity: a fader never rebuilds the encoders.
+struct AudioOutput {
+  std::string device;
+  std::string name;
   double volume = 1.0;
   bool muted = false;
 };
@@ -128,20 +121,14 @@ struct Config {
   int audio_bitrate_kbps = 192;
   // What the audio encoders capture: "auto" is the normal mode (audio_auto.h: the programs Windows says
   // are playing, three isolated lanes and Other audio), "desktop" is the output loopback and the
-  // microphone, "apps" is only the selected programs and the microphone. The saved routes below are kept
-  // in every mode and are only recorded in "apps", so switching modes never loses a selection
-  // (audio_routing.h). A directly constructed Config still says "desktop"; the first run and every file
-  // written before version 13 move to "auto".
+  // microphone, "outputs" is a loopback of each selected output plus the microphone. A directly
+  // constructed Config still says "desktop"; the first run and every file written before version 13 move
+  // to "auto". "apps" is the pre-version-14 manual mode and is read as "outputs".
   std::string audio_capture_mode = "desktop";
-  // Applications on their own tracks (Discord, a game), recorded only while audio_capture_mode is
-  // "apps". Four slots at most; each slot's track follows its position (3..6). While they record the
-  // desktop loopback is off, because Windows cannot record the desktop without the app that is also
-  // recorded on its own track (audio_routing.h). A file written by an older build may hold more than four:
-  // they are kept as written and the extra ones are reported as not recorded, never silently dropped.
-  std::vector<AudioApp> audio_apps;
-  // Whether the application selection has ever been written, including an intentionally empty one. Kept for
-  // compatibility with older files; it no longer seeds a list.
-  bool audio_apps_chosen = false;
+  // Output devices on their own tracks, recorded only while audio_capture_mode is "outputs". Four at
+  // most; each output's track follows its position (3..6) and every loopback is captured at once, so an
+  // app that plays to two outputs appears on both of their tracks.
+  std::vector<AudioOutput> audio_outputs;
   // Automatic mode's per-program controls, keyed by the lower-case executable name (audio_auto.h). A
   // fader, mute or exclude change is applied live and is never part of the routing identity: it does
   // not rebuild the encoders or clear the ring. Unknown keys are kept, so a newer build's preferences
@@ -150,9 +137,6 @@ struct Config {
   // The Other audio group's own controls, applied on top of each member's saved gain/mute.
   double audio_other_volume = 1.0;
   bool audio_other_muted = false;
-  // The mode a file recorded with before automatic mode became the normal one ("desktop" or "apps"). It
-  // is read for compatibility and never used to pick a route again; the saved routes stay in audio_apps.
-  std::string audio_capture_legacy_mode;
 
   // Rewind's bindings, carried over: Alt+1 saves, Ctrl+Alt+1 saves a quick clip, Alt+2 screenshots,
   // Alt+3 records. Every default comes from hotkey_defaults.h, the table Settings' Default and Reset
@@ -245,7 +229,7 @@ struct Config {
 
   int active_profile = -1;  // the profile applied last (index into profiles.json), -1 none
   int config_version = kConfigVersion;
-  static constexpr int kConfigVersion = 13;
+  static constexpr int kConfigVersion = 14;
 };
 
 // What a settings change does to the running pipeline. One table, so the refusal that protects a
@@ -279,12 +263,11 @@ inline int audio_track_count(const Config& config) {
   int tracks = config.audio_tracks >= 1 && config.audio_tracks <= 6 ? config.audio_tracks : 1;
   if (config.separate_tracks && tracks < 2) tracks = 3;
   if (config.separate_tracks && config.mic_enabled && tracks < 3) tracks = 3;
-  // An app slot needs its own encoder even when the explicit count says one: the plan puts slot i on
-  // track 3 + i (audio_routing.h), so the plan and the spill reservation must agree on every track the
-  // mixer writes to. Saved routes count only while the app mode records them; a route kept for later must
-  // not build encoders in desktop mode.
-  if (config.audio_capture_mode == "apps") {
-    const size_t slots = config.audio_apps.size() < 4 ? config.audio_apps.size() : 4;  // kAudioAppMax
+  // An output slot needs its own encoder even when the explicit count says one: the plan puts output i
+  // on track 3 + i (audio_routing.h), so the plan and the spill reservation must agree on every track the
+  // mixer writes to. Saved outputs count only while the outputs mode records them.
+  if (config.audio_capture_mode == "outputs") {
+    const size_t slots = config.audio_outputs.size() < 4 ? config.audio_outputs.size() : 4;  // kAudioOutputMax
     if (slots > 0 && tracks < static_cast<int>(slots) + 2) tracks = static_cast<int>(slots) + 2;
   }
   return tracks;
@@ -303,24 +286,11 @@ inline int audio_track_count(const Config& config) {
 // Version 8 fixes the shipped pad bindings: the old defaults had Record unbound and the panel on
 // View+Menu, while four actions are meant to ship bound (Record on View+Menu, panel on View+Y). A file
 // still carrying that exact pair moves; a chord the person chose is kept.
-// Version 9 adds application audio routes (`audio_apps`), empty in every file written before it: no
-// desktop loopback is lost and no existing recording's layout changes.
-// Version 10 adds `audio_capture_mode` ("desktop" or "apps"). A file that already has routes reads as
-// "apps", because that is what it recorded until now; a file without them reads as "desktop". The routes
-// are kept either way, so switching back to "apps" restores them. A file that already carries a valid mode
-// chose it, whatever its version says, so `mode_stored` keeps that value (config_from_json has parsed it).
-// Version 11 makes the application selection four slots whose tracks follow their position (3..6) and adds
-// the optional Current game slot (`kind`). A version 10 file's stored `track` numbers are ignored from now
-// on: its first four apps still record, each on its own track, and entries past the fourth are kept in the
-// file and reported as not recorded (status.audio.legacy_over) instead of being silently dropped.
-// Version 12 adds `audio_apps_chosen`: whether the application selection was ever written. It is kept for
-// compatibility with files that carry it; a selection is never seeded from it, so a new switch to Selected
-// apps starts empty and the person adds the programs to record.
-// Version 13 makes automatic capture the normal mode. A file that recorded desktop or selected apps moves to
-// "auto"; its old mode is kept in `audio_capture_legacy_mode`, its routes stay in `audio_apps` untouched, and
-// each route's gain and mute seed an automatic preference for the same executable. Files already written by
-// older builds keep their tracks: nothing reads the mode when a recorded file is opened.
-void migrate_config(Config& config, bool mode_stored = false);
+// Version 9 added application audio routes, version 10 the "apps" mode, version 11 four positional slots
+// and version 12 a first-use flag. Version 14 replaces that manual mode with output selection: an "apps"
+// file moves to "outputs" with the output device it already had, and the old routes are ignored. Automatic
+// capture (version 13) still uses per-program preferences, which are kept.
+void migrate_config(Config& config);
 
 // Whether a Timeline window is one the engine offers: 0 (off), 30, 60 or 120 minutes.
 bool timeline_minutes_allowed(int minutes);

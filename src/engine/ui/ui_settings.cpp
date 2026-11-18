@@ -19,7 +19,6 @@
 #include "misc/cpp/imgui_stdlib.h"
 #include "../config.h"
 #include "../audio_routing.h"
-#include "audio_speaker.h"
 #include "ui_audio_math.h"
 #include "ui_display_math.h"
 #include "../encoder_settings.h"
@@ -574,7 +573,7 @@ void device_row(ViewEnv& env, const char* key, const char* list_key, const std::
                 bool disabled) {
   begin_row(title, hint);
   const std::string current = env.store.config[key].as_string();
-  std::vector<std::string> ids{"default"}, labels{"Windows default"};
+  std::vector<std::string> ids{"default"}, labels{"System default"};
   for (const Json& device : env.panel.devices[list_key].items()) {
     const std::string id = device["id"].as_string();
     if (id == "default" || id.empty()) continue;
@@ -606,14 +605,6 @@ void volume_row(ViewEnv& env, const char* key, const char* mute_key, const char*
   end_row();
 }
 
-bool program_active(const Json& sessions, const std::string& exe) {
-  for (const Json& session : sessions["sessions"].items()) {
-    if (same_program(session["exe"].as_string(), exe)) return session["active"].as_bool();
-  }
-  return false;
-}
-
-
 void audio_section(ViewEnv& env) {
   PanelState& panel = env.panel;
   const Json& config = env.store.config;
@@ -622,14 +613,13 @@ void audio_section(ViewEnv& env) {
 
   const std::string mode = config["audio_capture_mode"].as_string("desktop");
   const bool auto_mode = audio_is_auto(config);
-  const bool apps_mode = mode == "apps";
-  if (!apps_mode) panel.picking_audio_app = false;
-  const Json apps = config["audio_apps"].is_array() ? config["audio_apps"] : Json::array();
+  const bool outputs_mode = mode == "outputs";
+  const Json outputs = config["audio_outputs"].is_array() ? config["audio_outputs"] : Json::array();
   const bool performance_on = env.store.status["performance"]["active"].as_bool();
   const bool mic = config["mic_enabled"].as_bool();
   const Json& status = env.store.status;
   // What Performance mode's own mix really records: it forces one track from the output device, never the
-  // app routes, and it does not turn the desktop or microphone switches back on.
+  // saved outputs, and it does not turn the desktop or microphone switches back on.
   const bool perf_desktop = config["desktop_enabled"].as_bool();
   const char* perf_mix = nullptr;
   if (perf_desktop && mic) perf_mix = "desktop audio and the microphone";
@@ -638,12 +628,12 @@ void audio_section(ViewEnv& env) {
 
   begin_section("##audiomode", "What to record");
   begin_row("Mode");
-  int selected_mode = auto_mode ? 0 : apps_mode ? 1 : 2;
+  int selected_mode = auto_mode ? 0 : outputs_mode ? 1 : 2;
   const bool mode_locked = !env.store.connected || status["recording"].as_bool() || status["rebuilding"].as_bool(false);
   if (mode_locked) ImGui::BeginDisabled();
   if (segmented("##capturemode", {"Automatic", "Manual", "All sound together"}, selected_mode, 0, 28, nullptr, 10)) {
     Json patch = Json::object();
-    patch.set("audio_capture_mode", Json(selected_mode == 0 ? "auto" : selected_mode == 1 ? "apps" : "desktop"));
+    patch.set("audio_capture_mode", Json(selected_mode == 0 ? "auto" : selected_mode == 1 ? "outputs" : "desktop"));
     if (selected_mode != 0) {
       patch.set("audio_tracks", Json(selected_mode == 1 ? 3 : 1));
       patch.set("separate_tracks", Json(selected_mode == 1));
@@ -654,8 +644,8 @@ void audio_section(ViewEnv& env) {
   if (mode_locked) ImGui::EndDisabled();
   end_row();
   note(auto_mode ? "Apps are discovered automatically; up to three have their own track and the rest share Other audio."
-       : apps_mode ? "Choose up to four apps to record on separate tracks."
-                   : "Desktop sound and the enabled microphone are recorded together on one track.");
+       : outputs_mode ? "Choose up to four outputs to record on separate tracks."
+                      : "Desktop sound and the enabled microphone are recorded together on one track.");
   if (mode_locked) note(status["recording"].as_bool() ? "Stop the recording first: changing audio mode rebuilds the encoder."
                                                        : status["rebuilding"].as_bool(false) ? "Wait for the encoder to finish rebuilding."
                                                                                              : "Connect to the engine to change audio mode.");
@@ -746,419 +736,144 @@ void audio_section(ViewEnv& env) {
     end_section();
   }
 
-  const bool desktop = config["desktop_enabled"].as_bool(), desktop_muted = config["desktop_muted"].as_bool();
-  if (!apps_mode && !auto_mode) {
+  if (outputs_mode) {
+    ImGui::Dummy(ImVec2(0, px(6)));
+    begin_section("##outputsaudio", "Selected outputs");
+    const Json& audio_status = status["audio"];
+    const bool output_change_locked = status["recording"].as_bool() || status["rebuilding"].as_bool(false);
+    const char* output_change_reason = status["recording"].as_bool()
+        ? "Stop the recording first: changing outputs rebuilds the encoder."
+        : "Wait for the encoder to finish rebuilding.";
+    const size_t slot_limit = static_cast<size_t>(kAudioOutputMax);
+    const size_t used = std::min(outputs.items().size(), slot_limit);
+    const bool full = used >= slot_limit;
+    const auto set_outputs = [&](const Json& list) { set(env, "audio_outputs", list); };
+    // A migrated slot can carry no saved name. The device list names it, and its track is labelled with the
+    // name that was saved when it was chosen.
+    const auto output_name = [&](const Json& output, size_t index) {
+      const std::string saved = output["name"].as_string();
+      if (!saved.empty()) return saved;
+      if (output["device"].as_string() == "default") return std::string("System default");
+      for (const Json& device : panel.devices["outputs"].items()) {
+        if (device["id"].as_string() == output["device"].as_string())
+          return device["name"].as_string(output["device"].as_string());
+      }
+      return "Output " + std::to_string(index + 1);
+    };
+    const auto output_present = [&](const Json& output) {
+      if (output["device"].as_string() == "default") return true;
+      if (panel.devices.is_null()) return true;  // still reading the list: never claim a device is gone
+      for (const Json& device : panel.devices["outputs"].items()) {
+        if (device["id"].as_string() == output["device"].as_string()) return true;
+      }
+      return false;
+    };
+
+    begin_row("Outputs", "Each output takes one slot and one track of its own.");
+    ImGui::AlignTextToFramePadding();
+    text(fonts().small, pal().muted, std::to_string(used) + " of " + std::to_string(slot_limit) + " output slots used");
+    ImGui::SameLine(0, px(8));
+    if (button("Add output##addoutput", Variant::normal, "plus", full || output_change_locked, 0, 34)) {
+      if (!full && !output_change_locked) ImGui::OpenPopup("##outputdevices");
+    }
+    const ImVec2 add_bottom_right = ImGui::GetItemRectMax();
+    tooltip(output_change_locked ? output_change_reason
+          : full                 ? "4 of 4 output slots used. Remove one first."
+                                 : "Add an output device.");
+    end_row();
+    if (output_change_locked) note(output_change_reason);
+
+    // The device list opens under the Add button, growing leftwards into the card: one row a device, and
+    // the same device twice is never added. A long endpoint name keeps its tail, which is what tells two
+    // otherwise identical HDMI outputs apart.
+    ImGui::SetNextWindowPos(ImVec2(add_bottom_right.x, add_bottom_right.y + px(4)), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    if (ImGui::BeginPopup("##outputdevices")) {
+      if (panel.devices.is_null()) {
+        text(fonts().small, pal().muted, "Reading the devices\xE2\x80\xA6");
+      } else {
+        const auto add_device = [&](const Json& device) {
+          set_outputs(audio_outputs_with_device(outputs, audio_output_entry(device), slot_limit));
+          ImGui::CloseCurrentPopup();
+        };
+        Json system = Json::object();
+        system.set("id", Json("default"));
+        system.set("name", Json("System default"));
+        const auto add_row = [&](const Json& device) {
+          const std::string device_id = device["id"].as_string();
+          for (const Json& chosen : outputs.items()) {
+            if (chosen["device"].as_string() == device_id) return;
+          }
+          std::string label = device["name"].as_string(device_id);
+          if (label.size() > 46) label = label.substr(0, 18) + "\xE2\x80\xA6" + label.substr(label.size() - 26);
+          if (button((label + "##out" + device_id).c_str(), Variant::ghost, "speaker", false, 320, 30))
+            add_device(device);
+        };
+        add_row(system);
+        for (const Json& device : panel.devices["outputs"].items()) {
+          if (device["id"].as_string() == "default" || device["id"].as_string().empty()) continue;
+          add_row(device);
+        }
+      }
+      ImGui::EndPopup();
+    }
+
+    for (size_t i = 0; i < used; ++i) {
+      const Json& output = outputs.items()[i];
+      const std::string name = output_name(output, i);
+      const std::vector<Json>& slot_health = audio_status["outputs"].items();
+      const bool failed = i < slot_health.size() && slot_health[i]["state"].as_string() == "failed";
+      const bool allocated = i < slot_health.size() && slot_health[i]["state"].as_string() == "connected";
+      const bool present = output_present(output);
+      const bool show_hint = failed || !present || !allocated;
+      const std::string hint = failed         ? "Could not capture this output; its track stays empty."
+                               : !present     ? "Not connected; its track stays empty until the device is back."
+                               : !allocated   ? "Waiting for the engine to open this output."
+                                              : "";
+      const std::string label = "Output " + std::to_string(i + 1) + ": " + name;
+      // Keep the slot's number, its name and the one control on the same 32-unit line, even when a state
+      // needs a second line. The number is the track the output records on.
+      const ImVec2 row = ImGui::GetCursorScreenPos();
+      const float width = ImGui::GetContentRegionAvail().x;
+      const float controls_x = row.x + width - px(34);
+      const float index_w = px(20);
+      ImGui::SetCursorScreenPos(ImVec2(row.x + px(1), row.y + (px(32) - fonts().small->LegacySize) / 2));
+      text(fonts().small, pal().faint, std::to_string(i + 1));
+      ImGui::SetCursorScreenPos(ImVec2(row.x + index_w, row.y + (px(32) - fonts().strong->LegacySize) / 2));
+      text_ellipsis(fonts().strong, pal().ink, name, std::max(px(20), controls_x - row.x - index_w - px(12)));
+      if (ImGui::IsItemHovered()) tooltip(label + (hint.empty() ? "" : "\n" + hint));
+      ImGui::SetCursorScreenPos(ImVec2(controls_x + px(2), row.y));
+      if (output_change_locked) ImGui::BeginDisabled();
+      if (icon_button(("##outputremove" + std::to_string(i)).c_str(), "close", "Remove " + label + " from the recording", false, 32, 15)) {
+        set_outputs(audio_outputs_without(outputs, i));
+      }
+      if (output_change_locked) ImGui::EndDisabled();
+      ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + px(32)));
+      if (show_hint) text_wrapped(fonts().small, failed || !present ? pal().danger : pal().muted, hint, width - px(34));
+      ImGui::Dummy(ImVec2(0, px(4)));
+    }
+
+    note(outputs.items().empty()
+             ? (mic ? "No outputs selected yet: only the microphone is recorded."
+                    : "No outputs selected yet, and the microphone is off. No audio is recorded; the picture still records.")
+             : (mic ? "Only the outputs you add and the microphone are recorded."
+                    : "Only the outputs you add are recorded, and the microphone is off."),
+         true);
+    end_section();
+  }
+
+  if (!outputs_mode && !auto_mode) {
     ImGui::Dummy(ImVec2(0, px(6)));
     begin_section("##desktop", "Desktop sound", [&] {
       // Level on the switch's own line, a hand's width left of the switch, centred on it.
       ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(62));
       ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(18));
-      level_bar(90, desktop && !desktop_muted ? env.store.desktop_level : 0.0f);
+      level_bar(90, config["desktop_enabled"].as_bool() && !config["desktop_muted"].as_bool() ? env.store.desktop_level : 0.0f);
     });
     device_row(env, "desktop_device", "outputs", "Output device", "Pick the speakers or headset you actually listen on.", false);
     volume_row(env, "desktop_volume", "desktop_muted", "speaker", "speakerOff", "desktop audio");
     end_section();
   }
 
-  if (apps_mode) {
-    ImGui::Dummy(ImVec2(0, px(6)));
-    begin_section("##appsaudio", "Selected apps");
-    const Json& status = env.store.status;
-    const Json& audio_status = status["audio"];
-    const bool app_change_locked = status["recording"].as_bool() || status["rebuilding"].as_bool(false);
-    const char* app_change_reason = status["recording"].as_bool()
-        ? "Stop the recording first: changing apps rebuilds the encoder."
-        : "Wait for the encoder to finish rebuilding.";
-    if (app_change_locked) panel.picking_audio_app = false;
-    const size_t slot_limit = static_cast<size_t>(kAudioAppMax);
-    const size_t used = std::min(apps.items().size(), slot_limit);
-    const size_t legacy_over = apps.items().size() > slot_limit ? apps.items().size() - slot_limit : 0;
-    const bool full = used >= slot_limit;
-    const bool addable = !full && legacy_over == 0;  // a legacy extra must be removed before a new slot is added
-    const auto set_apps = [&](const Json& list) {
-      Json patch = Json::object();
-      patch.set("audio_apps", list);
-      patch.set("audio_apps_chosen", Json(true));
-      env.store.set_config(patch);
-    };
-    const auto app_entry = [](const Json& window) {
-      Json entry = Json::object();
-      entry.set("window", Json(window["id"].as_string()));
-      entry.set("exe", Json(window["exe"].as_string()));
-      entry.set("title", Json(window["name"].as_string()));
-      entry.set("track", Json(2));  // written for older builds; the slot's position decides the track
-      return entry;
-    };
-    // The picker's snapshot: read only while the page shows a picker, never for a selection that is kept
-    // in desktop mode. A refresh keeps the rows it already has; only the first load has nothing to show.
-    if (panel.picking_audio_app) {
-      const bool first = panel.audio_programs.is_null();
-      if (first || env.now_ms - panel.audio_programs_at >= 3000) {
-        if (!panel.audio_programs_loading) {
-          panel.audio_programs_at = env.now_ms;
-          panel.audio_programs_loading = true;
-          auto& store = env.store;
-          auto& picker = panel;
-          store.bridge_call("sources.windows", Json::object(), [&store, &picker](bool ok, const Json& reply, const std::string&) {
-            picker.audio_programs_loading = false;
-            picker.audio_programs_first = false;
-            if (ok) picker.audio_programs = reply;  // a failure keeps the rows the picker already shows
-            store.dirty = true;
-          });
-        }
-      }
-    }
-    // A program's own meter: four times a second while the picker sorts and marks its rows, twice while only the
-    // selected rows show whether they are sounding. Read only while this page draws, so a closed panel or another
-    // Settings page asks for no sessions and samples no meter.
-    if (panel.picking_audio_app || used > 0) {
-      const uint32_t period = panel.picking_audio_app ? 250 : 500;
-      if (env.now_ms - panel.audio_sessions_at >= period) {
-        if (!panel.audio_sessions_loading) {
-          panel.audio_sessions_at = env.now_ms;
-          panel.audio_sessions_loading = true;
-          auto& store = env.store;
-          auto& picker = panel;
-          store.bridge_call("audio.sessions", Json::object(), [&store, &picker](bool ok, const Json& reply, const std::string&) {
-            picker.audio_sessions_loading = false;
-            if (ok) picker.audio_sessions = reply;
-            store.dirty = true;
-          });
-        }
-      }
-    }
-    // What the page knows about a slot, by the selection's order: the engine's own health.
-    const std::vector<Json>& slot_health = audio_status["slots"].items();
-    // One capacity reading, beside the one way to grow the selection. Each app takes a slot and its own
-    // track; the rows below say what each selection is doing now.
-    begin_row("Apps", "Each app takes one slot and one track of its own.");
-    ImGui::AlignTextToFramePadding();
-    text(fonts().small, pal().muted, std::to_string(used) + " of " + std::to_string(slot_limit) + " app slots used");
-    ImGui::SameLine(0, px(8));
-    if (button("Add app##appaudio", Variant::normal, "plus", !addable || app_change_locked, 0, 34)) {
-      if (addable) {
-        panel.picking_audio_app = true;
-        panel.audio_replace_slot = -1;
-        panel.audio_picked.clear();
-        panel.audio_search.clear();
-        panel.audio_programs_first = panel.audio_programs.is_null();
-      }
-    }
-    tooltip(app_change_locked ? app_change_reason
-          : legacy_over > 0 ? "Remove the saved apps that are not recorded first."
-          : full          ? "4 of 4 app slots used. Remove one first."
-                          : "Add a running app.");
-    end_row();
-    if (app_change_locked) note(app_change_reason);
-    for (size_t i = 0; i < used; ++i) {
-      const Json& app = apps.items()[i];
-      const bool game = app["kind"].as_string() == kAudioGameKind;
-      const std::string exe = app["exe"].as_string();
-      const std::string name = game ? std::string("Current game") : program_name(exe);
-      const bool failed = i < slot_health.size() && slot_health[i]["state"].as_string() == "failed";
-      const std::string state = i < slot_health.size() ? slot_health[i]["state"].as_string("waiting") : "waiting";
-      const bool show_hint = failed || state == "waiting" || !audio_status["recorded"].as_bool(true);
-      const std::string hint = audio_slot_hint(status, i, game, name);
-      const std::string activity_exe = i < slot_health.size() && !slot_health[i]["exe"].as_string().empty()
-                                           ? slot_health[i]["exe"].as_string() : exe;
-      // Keep the name and all three controls on the same 32-unit line, even when a state needs a second line.
-      const ImVec2 row = ImGui::GetCursorScreenPos();
-      const float width = ImGui::GetContentRegionAvail().x;
-      const float controls_x = row.x + width - px(90);
-      ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + (px(32) - fonts().strong->LegacySize) / 2));
-      text_ellipsis(fonts().strong, pal().ink, name, std::max(px(20), controls_x - row.x - px(12)));
-      if (ImGui::IsItemHovered()) tooltip(name + (hint.empty() ? "" : "\n" + hint));
-      const ImVec2 mark(controls_x, row.y + px(9));
-      audio_speaker_icon(panel.audio_sessions, activity_exe, mark, px(14), env.now_ms, panel);
-      const float peak = program_peak(panel.audio_sessions, activity_exe);
-      tooltip_rect(ImVec2(mark.x - px(2), mark.y - px(2)), ImVec2(mark.x + px(16), mark.y + px(16)),
-                   peak < 0.0f ? "Audio activity is unavailable" : peak >= kAudiblePeak ? "Making sound now" : "No sound right now");
-      ImGui::SetCursorScreenPos(ImVec2(controls_x + px(22), row.y));
-      if (app_change_locked) ImGui::BeginDisabled();
-      if (icon_button(("##appreplace" + std::to_string(i)).c_str(), "edit",
-                      "Replace this app: one change, the slot keeps its track", false, 32, 15)) {
-        if (legacy_over == 0) {
-          panel.picking_audio_app = true;
-          panel.audio_replace_slot = static_cast<int>(i);
-          panel.audio_picked.clear();
-          panel.audio_search.clear();
-          panel.audio_programs_first = panel.audio_programs.is_null();
-        }
-      }
-      ImGui::SameLine(0, px(4));
-      if (icon_button(("##appremove" + std::to_string(i)).c_str(), "close", "Remove this app", false, 32, 15)) {
-        Json list = Json::array();
-        for (size_t n = 0; n < apps.items().size(); ++n) {
-          if (n != i) list.push(apps.items()[n]);
-        }
-        set_apps(list);
-      }
-      if (app_change_locked) ImGui::EndDisabled();
-      ImGui::SetCursorScreenPos(ImVec2(row.x, row.y + px(32)));
-      if (show_hint) text_wrapped(fonts().small, failed ? pal().danger : pal().muted, hint, width - px(90));
-      ImGui::Dummy(ImVec2(0, px(4)));
-    }
-    // The card is gone in seconds and notices can be off, so the standing fact stays here: one line while the
-    // engine's own policy (status.audio.problem) still says audio is missing. It clears on recovery, another
-    // mode, Performance mode and while nothing records, and waits out a game that is still starting.
-    if (audio_status["problem_steady"].as_bool()) {
-      const std::string problem = audio_status["problem"].as_string();
-      const std::string game_exe = audio_status["game_exe"].as_string();
-      const std::string game = game_exe.empty() ? std::string() : program_name(game_exe);
-      if (problem == "game_missing" && !game.empty()) {
-        begin_row("Game audio is not recorded",
-                  game + " is playing, but Selected apps records only the apps you add. Add " + game +
-                      " under Add app, or choose All desktop sound.",
-                  pal().danger);
-        end_row();
-      } else if (problem == "game_waiting") {
-        begin_row("Game audio is not connected",
-                  (game.empty() ? std::string("The captured game") : game) +
-                      " is selected for audio, but its capture has not connected. Its track stays empty until it does.",
-                  pal().danger);
-        end_row();
-      } else if (problem == "all_unavailable") {
-        begin_row("Selected app audio is not connected",
-                  "None of the apps you selected has connected for audio capture. Start them; their tracks stay empty until they connect.",
-                  pal().danger);
-        end_row();
-      }
-    }
-    if (legacy_over > 0) {
-      note("Only four apps can be recorded. The saved apps below are not recorded; remove them to free the "
-           "space, or replace one of the four above.", true);
-      for (size_t i = slot_limit; i < apps.items().size(); ++i) {
-        const Json& app = apps.items()[i];
-        const std::string exe = app["exe"].as_string();
-        const std::string legacy_name =
-            app["kind"].as_string() == kAudioGameKind ? std::string("Current game") : program_name(exe);
-        begin_row(legacy_name, "Saved, not recorded: four slots are in use");
-        if (app_change_locked) ImGui::BeginDisabled();
-        if (icon_button(("##applegacy" + std::to_string(i)).c_str(), "close", "Remove this saved app", false, 28, 15)) {
-          Json list = Json::array();
-          for (size_t n = 0; n < apps.items().size(); ++n) {
-            if (n != i) list.push(apps.items()[n]);
-          }
-          set_apps(list);
-        }
-        if (app_change_locked) ImGui::EndDisabled();
-        end_row();
-      }
-    }
-
-    // The list of programs is one way to add a source: the app the person picks, with one four-slot limit.
-
-    if (panel.picking_audio_app) {
-      // The picker draws in a fixed footprint: six rows whether it is loading, empty or full, so a refresh
-      // never moves the page under the pointer. Order is frozen while the pointer, a key or the wheel is in
-      // it, and re-sorted only after a short hold, loudest first.
-      const float row_h = px(36), row_gap = px(4), list_pad = px(6);
-      const float list_h = 6 * row_h + 5 * row_gap + list_pad * 2;
-      const bool replace = panel.audio_replace_slot >= 0;
-      begin_row(replace ? "Replace an application" : "Add an application",
-                replace ? "One entry per running program. The chosen app replaces this slot."
-                        : "One entry per running program. Apps playing audio appear first.",
-                0, px(34));
-      if (button("Cancel##appcancel", Variant::ghost, "close", false, 0, 34)) {
-        panel.picking_audio_app = false;
-      }
-      ImGui::SameLine();
-      if (!replace) {
-        const int picks = static_cast<int>(panel.audio_picked.size());
-        const bool can_add = picks > 0 && used + static_cast<size_t>(picks) <= slot_limit && legacy_over == 0;
-        if (button(("Add" + (picks > 1 ? " " + std::to_string(picks) + "##appadd" : std::string("##appadd"))).c_str(),
-                   Variant::primary, "plus", !can_add, 0, 34)) {
-          Json list = Json::array();
-          for (const Json& app : apps.items()) list.push(app);
-          for (const std::string& picked : panel.audio_picked) {
-            for (const Json& window : panel.audio_programs.items()) {
-              if (!same_program(window["exe"].as_string(), picked)) continue;
-              list.push(app_entry(window));
-              break;
-            }
-          }
-          set_apps(list);
-          panel.picking_audio_app = false;
-        }
-      }
-      end_row();
-      begin_row("Search", "Filter by program name or executable.");
-      if (text_field("##audiosearch", panel.audio_search, px(220), "Search apps", 64)) panel.audio_activity_at = env.now_ms;
-      ImGui::SameLine(0, px(8));
-      if (button("Refresh##apprefresh", Variant::ghost, "refresh", panel.audio_programs_loading, 0, 26)) {
-        panel.audio_programs_at = 0;  // the next frame asks again; the rows stay
-        panel.audio_activity_at = env.now_ms;
-      }
-      end_row();
-
-      // The order, rebuilt only when the pointer has left and nothing else is moving; the exes are the
-      // identity, because a window title changes and a window id is not stable across runs.
-      const bool frozen = env.now_ms - panel.audio_activity_at < 1500;
-      if (panel.audio_order.empty() || (!frozen && env.now_ms - panel.audio_order_at >= 1000)) {
-        std::vector<Json> choices = audio_program_choices(panel.audio_programs);
-        std::sort(choices.begin(), choices.end(), [&](const Json& left, const Json& right) {
-          const bool loud_left = program_sounding(panel.audio_sessions, left["exe"].as_string());
-          const bool loud_right = program_sounding(panel.audio_sessions, right["exe"].as_string());
-          if (loud_left != loud_right) return loud_left;
-          const bool run_left = program_active(panel.audio_sessions, left["exe"].as_string());
-          const bool run_right = program_active(panel.audio_sessions, right["exe"].as_string());
-          if (run_left != run_right) return run_left;
-          return lower_text(left["exe"].as_string()) < lower_text(right["exe"].as_string());
-        });
-        panel.audio_order.clear();
-        for (const Json& choice : choices) panel.audio_order.push_back(choice["exe"].as_string());
-        panel.audio_order_at = env.now_ms;
-      }
-
-      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, row_gap));
-      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(8), list_pad));
-      // The list below always takes the same six-row footprint.
-      ImGui::BeginChild("##audioprograms", ImVec2(0, list_h), ImGuiChildFlags_None, ImGuiWindowFlags_None);
-      // The wheel is the list's own: the page around it does not glide while the pointer is here
-      // (smooth_scroll's wheel_owned_by_child), and the list reaches its end without moving the page.
-      wheel_owner_rect(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
-                                                       ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
-      const bool pointer_in_list = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
-      if (pointer_in_list) panel.audio_activity_at = env.now_ms;
-      const bool first_load = panel.audio_programs_first || (panel.audio_programs.is_null() && panel.audio_programs_loading);
-      if (first_load) {
-        const ImVec2 pos = ImGui::GetCursorScreenPos();
-        spinner(ImGui::GetWindowDrawList(),
-                ImVec2(pos.x + ImGui::GetContentRegionAvail().x / 2, pos.y + list_h / 2 - list_pad), px(8), pal().accent);
-      } else {
-        std::vector<std::string> problems;  // programs the snapshot names, for marking a chosen one
-        for (const Json& app : apps.items()) problems.push_back(app["exe"].as_string());
-        int drawn = 0;
-        const std::string search = lower_text(panel.audio_search);
-        // One compact row for every source. The details behind the pointer keep the row to a name; the
-        // marker says whether the source is already in the selection or only ticked for this add.
-        const auto picker_row = [&](const char* id, const std::string& name, const std::string& details, bool ticked,
-                                    bool in_use, bool selectable, bool activity) {
-          ImGui::PushID(id);
-          const ImVec2 min = ImGui::GetCursorScreenPos();
-          const float width = ImGui::GetContentRegionAvail().x;
-          const bool pressed = ImGui::InvisibleButton("program", ImVec2(width, row_h)) && selectable;
-          const bool hovered = ImGui::IsItemHovered();
-          if (hovered || ticked || ImGui::IsItemFocused() || ImGui::IsItemActive()) panel.audio_activity_at = env.now_ms;
-          ImDrawList* draw = ImGui::GetWindowDrawList();
-          const ImVec2 max(min.x + width, min.y + row_h);
-          if (hovered) draw->AddRectFilled(min, max, pal().raised);
-          draw->AddRect(min, max, ticked ? pal().accent : (hovered ? pal().line_strong : pal().line), 0, 0, 1.0f);
-          // The program's own speaker: waves only while its meter says it is making sound now, a still body for a
-          // measured silence, and a faint one when the meter is unknown. The row never claims a capture from sound.
-          audio_speaker_icon(panel.audio_sessions, id, ImVec2(min.x + px(7), min.y + (row_h - px(14)) / 2), px(14),
-                             env.now_ms, panel);
-          const ImVec2 name_min(min.x + px(24), min.y + (row_h - fonts().strong->LegacySize) / 2);
-          const float name_right = min.x + width - px(76);
-          ImGui::PushFont(fonts().strong);
-          ImGui::PushStyleColor(ImGuiCol_Text, pal().ink);
-          ImGui::RenderTextEllipsis(draw, name_min, ImVec2(name_right, name_min.y + fonts().strong->LegacySize),
-                                    name_right, name.c_str(), nullptr, nullptr);
-          ImGui::PopStyleColor();
-          ImGui::PopFont();
-          if (ticked) {
-            draw_icon(draw, "check", ImVec2(min.x + width - px(20), min.y + px(10)), px(13), pal().accent, 1.6f);
-          } else if (in_use) {
-            const std::string marker = "In use";
-            const float marker_w = text_width(fonts().small, marker);
-            draw->AddText(fonts().small, fonts().small->LegacySize,
-                          ImVec2(min.x + width - px(12) - marker_w, min.y + (row_h - fonts().small->LegacySize) / 2),
-                          pal().muted, marker.c_str());
-          }
-          if (hovered) {
-            // The speaker and this line never claim more than the meter says: an unavailable meter cannot
-            // prove that a running stream is silent.
-            const float peak = program_peak(panel.audio_sessions, id);
-            std::string tip = details;
-            if (!selectable) {
-              tip = "Already selected in another slot" + (tip.empty() ? "" : "\n" + tip);
-            } else if (activity) {
-              if (!tip.empty()) tip += "\n";
-              tip += peak < 0.0f ? "Audio activity is unavailable"
-                   : peak >= kAudiblePeak ? "Making sound now"
-                                          : "No sound right now";
-            }
-            tooltip_rect(min, max, tip);
-          }
-          ImGui::PopID();
-          return pressed;
-        };
-        for (const std::string& exe : panel.audio_order) {
-          if (!search.empty() && lower_text(exe).find(search) == std::string::npos &&
-              lower_text(program_name(exe)).find(search) == std::string::npos) {
-            continue;
-          }
-          Json window = Json::object();
-          for (const Json& choice : panel.audio_programs.items()) {
-            if (same_program(choice["exe"].as_string(), exe)) {
-              window = choice;
-              break;
-            }
-          }
-          if (window.is_null() || window["exe"].as_string().empty()) continue;
-          const bool chosen = std::any_of(problems.begin(), problems.end(),
-                                          [&](const std::string& other) { return same_program(other, exe); });
-          const bool ticked = std::find(panel.audio_picked.begin(), panel.audio_picked.end(), exe) != panel.audio_picked.end();
-          const bool ticked_here = replace ? false : ticked;
-          const bool replacing_this =
-              replace && static_cast<size_t>(panel.audio_replace_slot) < apps.items().size() &&
-              same_program(apps.items()[static_cast<size_t>(panel.audio_replace_slot)]["exe"].as_string(), exe);
-          const bool room = used + panel.audio_picked.size() < slot_limit;
-          const bool selectable = replace ? (!chosen || replacing_this) : (!chosen && (ticked || room));
-          if (picker_row(exe.c_str(), program_name(exe), exe + "\n" + window["name"].as_string(), ticked_here, chosen,
-                         selectable, true)) {
-            if (replace) {
-              Json list = Json::array();
-              for (size_t n = 0; n < apps.items().size(); ++n) {
-                if (n == static_cast<size_t>(panel.audio_replace_slot)) {
-                  list.push(app_entry(window));
-                } else {
-                  list.push(apps.items()[n]);
-                }
-              }
-              set_apps(list);
-              panel.picking_audio_app = false;
-            } else {
-              const auto found = std::find(panel.audio_picked.begin(), panel.audio_picked.end(), exe);
-              if (found != panel.audio_picked.end()) panel.audio_picked.erase(found);
-              else panel.audio_picked.push_back(exe);
-            }
-          }
-          ++drawn;
-        }
-        if (drawn == 0) {
-          text(fonts().small, pal().faint,
-               panel.audio_order.empty() ? "No application windows found. Open the app, then refresh."
-                                         : "No app matches that search.");
-        }
-      }
-      ImGui::EndChild();
-      ImGui::PopStyleVar(2);
-    }
-    // One plain warning, always visible in this mode: what is recorded, what is not, and whether the
-    // microphone is in it. The Windows reason for the limit is not repeated here, and Performance mode's
-    // one statement already sits under the mode choice: it is not said a second time here.
-    if (!performance_on) {
-      note(apps.items().empty()
-               ? (mic ? "No apps selected yet: only the microphone is recorded. Other apps and system sounds are left out."
-                      : "No apps selected yet, and the microphone is off. No audio is recorded; the picture still records.")
-               : (mic ? "Only the apps you add and the microphone are recorded. Other apps and system sounds are left out."
-                      : "Only the apps you add are recorded. Other apps and system sounds are left out, and the microphone is off."),
-           true);
-    }
-    // Holds belong to the rows on screen: a program that left the selection or the picker list drops its own.
-    std::vector<std::string> speaking;
-    for (size_t i = 0; i < used; ++i) {
-      speaking.push_back(i < slot_health.size() && !slot_health[i]["exe"].as_string().empty()
-                             ? slot_health[i]["exe"].as_string()
-                             : apps.items()[i]["exe"].as_string());
-    }
-    if (panel.picking_audio_app) speaking.insert(speaking.end(), panel.audio_order.begin(), panel.audio_order.end());
-    audio_speaker_prune(speaking);
-    end_section();
-  }
-
-  ImGui::Dummy(ImVec2(0, px(6)));
   const bool mic_muted = config["mic_muted"].as_bool();
   begin_section("##mic", "Microphone", [&] {
     // Level on the switch's own line, a hand's width left of the switch, centred on it.

@@ -3,6 +3,7 @@
 // interface's own toasts. Lives on the interface's thread; the bridge delivers replies and events.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -106,6 +107,11 @@ public:
   Json hello, status, config, hotkeys;
   // Window-thread samples, updated faster than the engine's status event while a meter is visible.
   float desktop_level = 0.0f, mic_level = 0.0f;
+  // One per selected output, in slot order. A fixed array written from the tick thread and read by the
+  // window thread: the same benign race as the two levels above, never an allocation.
+  static constexpr int kOutputLevelSlots = 4;  // kAudioOutputMax
+  std::array<float, kOutputLevelSlots> output_levels{};
+  int output_level_count = 0;
   // What Settings -> Games lists as never a game (`game.exclusions`: the built-in names and the user's own). Not part of the
   // status, which is built twice a second: it is read when that section is drawn and read again when the user's list changes.
   Json exclusions;
